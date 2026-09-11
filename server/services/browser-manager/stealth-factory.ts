@@ -107,23 +107,30 @@ export async function launchStealthContext(options: LaunchStealthOptions): Promi
 
   const proxyConfig = parseProxy(options.proxyUrl);
 
-  const context = (await chromium.launchPersistentContext(profileDir, {
+  const launchOptions: any = {
     headless: options.headless !== undefined ? options.headless : true,
     proxy: proxyConfig,
     userAgent: options.userAgent || DEFAULT_USER_AGENT,
     locale: options.locale || 'en-US',
     timezoneId: options.timezone || 'America/New_York',
     viewport: { width: 1280, height: 800 },
-    ignoreHTTPSErrors: true,
+    ignoreHTTPSErrors: false,
     args: [
       '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
       '--disable-infobars',
       '--disable-dev-shm-usage',
-      '--disable-features=IsolateOrigins,site-per-process',
       '--window-size=1280,800',
     ],
-  })) as BrowserContext;
+  };
+
+  if (
+    fs.existsSync('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe') ||
+    fs.existsSync('C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe')
+  ) {
+    launchOptions.channel = 'chrome';
+  }
+
+  const context = (await chromium.launchPersistentContext(profileDir, launchOptions)) as BrowserContext;
 
   return context;
 }

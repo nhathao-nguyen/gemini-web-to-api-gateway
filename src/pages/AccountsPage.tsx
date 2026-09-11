@@ -25,6 +25,7 @@ import {
   Check,
   Play,
   RotateCw,
+  Loader2,
 } from 'lucide-react';
 import {
   fetchAccounts,
@@ -380,7 +381,7 @@ export const AccountsPage: React.FC = () => {
 
   const handleTestSession = async (id: string) => {
     setTestingId(id);
-    setActionFeedback(null);
+    setActionFeedback('Đang kết nối kiểm tra tài khoản Gemini...');
     try {
       const res = await testAccountSession(id);
       queryClient.invalidateQueries({ queryKey: ['accounts'] });
@@ -561,10 +562,10 @@ export const AccountsPage: React.FC = () => {
             onClick={() => refetch()}
             disabled={isFetching}
             className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-zinc-700 bg-white border border-zinc-200 rounded-xl hover:bg-zinc-50 transition-colors disabled:opacity-50 shadow-2xs"
-            title="Làm mới danh sách"
+            title="Refresh accounts list"
           >
             <RefreshCw className={`w-3.5 h-3.5 text-zinc-500 ${isFetching ? 'animate-spin' : ''}`} />
-            <span>Làm mới</span>
+            <span>Refresh</span>
           </button>
 
           <button
@@ -572,7 +573,7 @@ export const AccountsPage: React.FC = () => {
             className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-zinc-700 bg-white border border-zinc-300 rounded-xl hover:bg-zinc-50 transition-colors shadow-2xs"
           >
             <KeyRound className="w-3.5 h-3.5 text-zinc-500" />
-            <span>Thêm bằng Cookie</span>
+            <span>Add via Cookie</span>
           </button>
 
           <button
@@ -580,7 +581,7 @@ export const AccountsPage: React.FC = () => {
             className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition-all shadow-sm hover:shadow-md"
           >
             <Sparkles className="w-4 h-4 text-amber-300" />
-            <span>Browser Login (Tự Động)</span>
+            <span>Browser Login</span>
           </button>
         </div>
       </div>
@@ -589,11 +590,15 @@ export const AccountsPage: React.FC = () => {
       {actionFeedback && (
         <div className="p-3.5 rounded-xl bg-zinc-900 text-zinc-100 text-xs flex items-center justify-between shadow-md transition-all">
           <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            {actionFeedback.startsWith('Đang') ? (
+              <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+            ) : (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            )}
             <span>{actionFeedback}</span>
           </div>
           <button onClick={() => setActionFeedback(null)} className="text-zinc-400 hover:text-white text-xs underline ml-4">
-            Đóng
+            Close
           </button>
         </div>
       )}
@@ -607,16 +612,16 @@ export const AccountsPage: React.FC = () => {
             </div>
             <div>
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-semibold text-sm text-zinc-100">Hệ Thống Keep-Alive 24/7 (Headless Bot)</span>
+                <span className="font-semibold text-sm text-zinc-100">Keep-Alive 24/7 System (Headless Bot)</span>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> Đang giám sát ngầm
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> Active Monitoring
                 </span>
                 <span className="text-[10px] text-zinc-400 font-mono bg-white/5 px-2 py-0.5 rounded-md border border-white/10">
-                  Sequential Queue • Tiết kiệm RAM
+                  Sequential Queue • Low RAM
                 </span>
               </div>
               <p className="text-xs text-zinc-300 mt-1 max-w-2xl">
-                {keepaliveReport?.lastSummary || 'Tự động kiểm tra và làm mới __Secure-1PSIDTS cho từng tài khoản theo hàng đợi tuần tự.'}
+                {keepaliveReport?.lastSummary || 'Automatically verifies and refreshes __Secure-1PSIDTS cookies sequentially.'}
               </p>
             </div>
           </div>
@@ -624,13 +629,13 @@ export const AccountsPage: React.FC = () => {
           <div className="flex items-center gap-3 shrink-0">
             <div className="grid grid-cols-2 gap-3 text-right">
               <div className="bg-white/5 border border-white/10 rounded-xl px-3 py-1.5">
-                <div className="text-[10px] text-zinc-400 uppercase font-semibold">Đã làm mới</div>
+                <div className="text-[10px] text-zinc-400 uppercase font-semibold">Refreshed</div>
                 <div className="text-base font-mono font-bold text-emerald-400">
                   {keepaliveReport?.totalRefreshedSuccess || 0}
                 </div>
               </div>
               <div className="bg-white/5 border border-white/10 rounded-xl px-3 py-1.5">
-                <div className="text-[10px] text-zinc-400 uppercase font-semibold">Lỗi phiên</div>
+                <div className="text-[10px] text-zinc-400 uppercase font-semibold">Session Errors</div>
                 <div className="text-base font-mono font-bold text-rose-400">
                   {keepaliveReport?.totalRefreshedFailed || 0}
                 </div>
@@ -640,7 +645,7 @@ export const AccountsPage: React.FC = () => {
             <button
               onClick={() => refetchKeepalive()}
               className="p-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/10 text-zinc-300 hover:text-white transition-colors"
-              title="Cập nhật trạng thái Worker"
+              title="Refresh Worker Status"
             >
               <RefreshCw className="w-4 h-4" />
             </button>

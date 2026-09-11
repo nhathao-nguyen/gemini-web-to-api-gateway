@@ -57,6 +57,9 @@ export class GatewayService {
     // 2. Attach existing conversation state from DB if requested
     let localConv = request.conversation_id ? db.getConversation(request.conversation_id) : undefined;
     if (localConv) {
+      if (localConv.api_key_id && localConv.api_key_id !== apiKey.id) {
+        throw new Error('CONVERSATION_NOT_FOUND: Conversation not found or access denied');
+      }
       request.upstream_cid = localConv.upstream_cid || request.upstream_cid;
       request.upstream_rid = localConv.upstream_rid || request.upstream_rid;
       request.upstream_rcid = localConv.upstream_rcid || request.upstream_rcid;
@@ -222,9 +225,9 @@ export class GatewayService {
     requestId: string
   ): Promise<{ created: number; data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }> }> {
     const startTime = Date.now();
-    const modelToUse = request.model || 'gemini-3.1-pro';
+    const modelToUse = request.model || accountScheduler.getAvailableModels()[0] || 'gemini-2.5-flash';
 
-    const targetAccount = accountScheduler.selectAccount(modelToUse);
+    const targetAccount = accountScheduler.selectAccount(modelToUse) || accountScheduler.selectAnyActiveAccount();
     if (!targetAccount) {
       throw new Error(`NO_HEALTHY_ACCOUNTS: No active Gemini account available for image generation`);
     }
@@ -332,9 +335,29 @@ export class GatewayService {
 
     let localConv = request.conversation_id ? db.getConversation(request.conversation_id) : undefined;
     if (localConv) {
+      if (localConv.api_key_id && localConv.api_key_id !== apiKey.id) {
+        throw new Error('CONVERSATION_NOT_FOUND: Conversation not found or access denied');
+      }
       request.upstream_cid = localConv.upstream_cid || request.upstream_cid;
       request.upstream_rid = localConv.upstream_rid || request.upstream_rid;
       request.upstream_rcid = localConv.upstream_rcid || request.upstream_rcid;
+
+      // Log user message to conversation history
+      const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user');
+      const userText = lastUserMsg
+        ? typeof lastUserMsg.content === 'string'
+          ? lastUserMsg.content
+          : JSON.stringify(lastUserMsg.content)
+        : '';
+      if (userText) {
+        db.createMessage({
+          id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+          conversation_id: localConv.id,
+          role: 'user',
+          content: userText,
+          created_at: new Date().toISOString(),
+        });
+      }
     } else if (request.conversation_id?.startsWith('c_') && !request.upstream_cid) {
       request.upstream_cid = request.conversation_id;
     }
@@ -398,6 +421,8 @@ export class GatewayService {
 
     const chunkId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
     let fullText = '';
+    let fullReasoning = '';
+    let streamImages: any[] = [];
     let lastConvId: string | undefined;
     let lastRespId: string | undefined;
     let lastChoiceId: string | undefined;
@@ -422,6 +447,7 @@ export class GatewayService {
         if (chunk.choice_id) lastChoiceId = chunk.choice_id;
 
         if (chunk.reasoning_delta) {
+          fullReasoning += chunk.reasoning_delta;
           yield OpenAIAdapter.toChatCompletionChunk(
             chunkId,
             request.model,
@@ -451,6 +477,9 @@ export class GatewayService {
         }
 
         if (chunk.is_done) {
+          if (chunk.images && chunk.images.length > 0) {
+            streamImages = chunk.images;
+          }
           yield OpenAIAdapter.toChatCompletionChunk(
             chunkId,
             request.model,
@@ -490,6 +519,8 @@ export class GatewayService {
           conversation_id: localConv.id,
           role: 'assistant',
           content: fullText,
+          reasoning_content: fullReasoning || undefined,
+          generated_media: streamImages.length > 0 ? streamImages : undefined,
           created_at: new Date().toISOString(),
         });
       }

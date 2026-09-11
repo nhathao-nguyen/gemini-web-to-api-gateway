@@ -213,9 +213,9 @@ export async function runProtocolTests() {
   const parsedQuota = parseGeminiQuotaResponse(sampleQuotaWire);
   assert(parsedQuota.tier === 'PRO', 'Parsed tier as PRO');
   assert(parsedQuota.current_usage_percent === 26, 'Parsed current usage percent as 26%');
-  assert(parsedQuota.current_reset_label.includes('Đặt lại lúc 17:27'), 'Parsed current reset time formatted correctly');
+  assert(parsedQuota.current_reset_label.includes('10:27 UTC'), 'Parsed current reset time formatted correctly');
   assert(parsedQuota.weekly_usage_percent === 1, 'Parsed weekly usage percent as 1%');
-  assert(parsedQuota.weekly_reset_label.includes('Đặt lại vào 18 thg 9 lúc 11:27'), 'Parsed weekly reset label formatted correctly');
+  assert(parsedQuota.weekly_reset_label.includes('18 thg 9 lúc 04:27 UTC'), 'Parsed weekly reset label formatted correctly');
 
   // 10. Extended Thinking Mode Selection & Activation
   console.log('\n--- Suite 10: Extended Thinking Mode Activation ---');

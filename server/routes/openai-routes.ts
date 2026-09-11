@@ -81,6 +81,16 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
 
     const payload = parseResult.data as unknown as import('../types.js').ChatCompletionRequest;
 
+    // Validate conversation ownership if conversation_id is provided
+    if (payload.conversation_id) {
+      const conv = db.getConversation(payload.conversation_id);
+      if (!conv || conv.api_key_id !== apiKey.id) {
+        return res
+          .status(404)
+          .json(OpenAIAdapter.formatError('Conversation not found', 'conversation_not_found', 'invalid_request_error'));
+      }
+    }
+
     if (payload.stream) {
       try {
         const stream = gatewayService.handleChatCompletionStream(
@@ -215,9 +225,8 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
     return res.status(400).json(OpenAIAdapter.formatError('File size exceeds 20MB limit', 'file_too_large'));
   }
 
-  const targetAccount = accountScheduler.selectAccount('gemini-3.8-flash');
+  const targetAccount = accountScheduler.selectAnyActiveAccount();
   if (!targetAccount) {
-
     await rateLimiter.release(apiKey.id);
     return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account for upload', 'no_healthy_accounts'));
   }
@@ -252,7 +261,8 @@ openaiRouter.post('/conversations', authMiddleware, async (req: Request, res: Re
   const apiKey = (req as any).gatewayApiKey;
   const id = `conv_${crypto.randomBytes(12).toString('hex')}`;
   const title = (req.body?.title || 'New Conversation').trim().slice(0, 100);
-  const model = req.body?.model || 'gemini-3.8-flash';
+  const defaultModel = accountScheduler.getAvailableModels()[0] || 'gemini-2.5-flash';
+  const model = req.body?.model || defaultModel;
   const now = new Date().toISOString();
 
   const conv = {
@@ -276,6 +286,55 @@ openaiRouter.get('/conversations', authMiddleware, async (req: Request, res: Res
   const convs = db.listConversations(apiKey.id);
   await rateLimiter.release(apiKey.id);
   return res.json({ object: 'list', data: convs });
+});
+
+// GET /v1/conversations/upstream-recent (Registered before /:id to prevent route shadowing)
+openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: Request, res: Response) => {
+  const apiKey = (req as any).gatewayApiKey;
+  const targetAccount = accountScheduler.selectAnyActiveAccount();
+
+  if (!targetAccount) {
+    await rateLimiter.release(apiKey.id);
+    return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account found', 'no_healthy_accounts'));
+  }
+
+  try {
+    const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
+    const conversations = await geminiProvider.fetchRecentConversations(targetAccount, limit);
+    return res.json({
+      object: 'list',
+      data: conversations,
+    });
+  } catch (err: any) {
+    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to fetch upstream conversations', 'upstream_error'));
+  } finally {
+    await rateLimiter.release(apiKey.id);
+  }
+});
+
+// GET /v1/conversations/upstream/:cid/turns (Registered before /:id)
+openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (req: Request, res: Response) => {
+  const apiKey = (req as any).gatewayApiKey;
+  const targetAccount = accountScheduler.selectAnyActiveAccount();
+
+  if (!targetAccount) {
+    await rateLimiter.release(apiKey.id);
+    return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account found', 'no_healthy_accounts'));
+  }
+
+  try {
+    const data = await geminiProvider.fetchConversationHistory(targetAccount, req.params.cid);
+    return res.json({
+      conversation_id: req.params.cid,
+      turns: data.turns,
+      last_rid: data.lastRid,
+      last_rcid: data.lastRcid,
+    });
+  } catch (err: any) {
+    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to fetch upstream conversation turns', 'upstream_error'));
+  } finally {
+    await rateLimiter.release(apiKey.id);
+  }
 });
 
 // GET /v1/conversations/:id
@@ -345,55 +404,6 @@ openaiRouter.post('/conversations/:id/messages', authMiddleware, async (req: Req
     return res.json(response);
   } catch (err: any) {
     return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to send message', 'conversation_error'));
-  } finally {
-    await rateLimiter.release(apiKey.id);
-  }
-});
-
-// GET /v1/conversations/upstream-recent
-openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const targetAccount = accountScheduler.selectAccount('gemini-3.8-flash');
-
-  if (!targetAccount) {
-    await rateLimiter.release(apiKey.id);
-    return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account found', 'no_healthy_accounts'));
-  }
-
-  try {
-    const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
-    const conversations = await geminiProvider.fetchRecentConversations(targetAccount, limit);
-    return res.json({
-      object: 'list',
-      data: conversations,
-    });
-  } catch (err: any) {
-    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to fetch upstream conversations', 'upstream_error'));
-  } finally {
-    await rateLimiter.release(apiKey.id);
-  }
-});
-
-// GET /v1/conversations/upstream/:cid/turns
-openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const targetAccount = accountScheduler.selectAccount('gemini-3.8-flash');
-
-  if (!targetAccount) {
-    await rateLimiter.release(apiKey.id);
-    return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account found', 'no_healthy_accounts'));
-  }
-
-  try {
-    const data = await geminiProvider.fetchConversationHistory(targetAccount, req.params.cid);
-    return res.json({
-      conversation_id: req.params.cid,
-      turns: data.turns,
-      last_rid: data.lastRid,
-      last_rcid: data.lastRcid,
-    });
-  } catch (err: any) {
-    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to fetch upstream conversation turns', 'upstream_error'));
   } finally {
     await rateLimiter.release(apiKey.id);
   }

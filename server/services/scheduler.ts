@@ -157,6 +157,26 @@ export class AccountScheduler {
   }
 
   /**
+   * Select any active eligible account without binding to a specific model
+   */
+  public selectAnyActiveAccount(excludedIds: string[] = []): GeminiAccount | null {
+    const allAccounts = db.getAccounts();
+    const eligible = allAccounts.filter(
+      (a) =>
+        !excludedIds.includes(a.id) &&
+        a.status === 'ACTIVE' &&
+        !quotaManager.isCoolingDown(a)
+    );
+
+    if (eligible.length === 0) {
+      return null;
+    }
+
+    eligible.sort((a, b) => this.calculateScore(b) - this.calculateScore(a));
+    return eligible[0];
+  }
+
+  /**
    * Get dynamic list of currently available models across all eligible active accounts
    */
   public getAvailableModels(): string[] {

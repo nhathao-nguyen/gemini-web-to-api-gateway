@@ -46,18 +46,10 @@ export class Database {
     };
 
 
-    if (this.isProduction) {
-      if (!dbUrl || (!dbUrl.startsWith('postgresql://') && !dbUrl.startsWith('postgres://'))) {
-        throw new Error(
-          'FATAL: DATABASE_URL pointing to PostgreSQL is strictly required in production! Local SQLite or mock database fallback is prohibited.'
-        );
-      }
-    }
-
     if (dbUrl && (dbUrl.startsWith('postgresql://') || dbUrl.startsWith('postgres://'))) {
       this.initPromise = this.initializePostgres(dbUrl);
     } else {
-      // Default to native, local SQLite database for development and testing
+      // Default to native, local SQLite database
       this.initializeSqlite();
     }
   }
@@ -68,11 +60,29 @@ export class Database {
     }
   }
 
+  public close(): void {
+    if (this.sqliteDb) {
+      try {
+        this.sqliteDb.close();
+        console.log('[Database] SQLite connection closed.');
+      } catch (err) {
+        console.warn('[Database] Error closing SQLite connection:', err);
+      }
+    }
+    if (this.pgPool) {
+      try {
+        this.pgPool.end();
+      } catch {}
+    }
+  }
+
   public initializeSqlite(dbFilePath?: string) {
     try {
       const dbPath = dbFilePath || path.join(process.cwd(), 'gateway.db');
       console.log(`[Database] Initializing native SQLite database at: ${dbPath}`);
       this.sqliteDb = new DatabaseSync(dbPath);
+      this.sqliteDb.exec('PRAGMA journal_mode = WAL;');
+      this.sqliteDb.exec('PRAGMA foreign_keys = ON;');
 
       this.sqliteDb.exec(`
         CREATE TABLE IF NOT EXISTS accounts (

@@ -28,6 +28,17 @@ export class QuotaManager {
     if (!account) return;
 
     const errMsg = typeof error === 'string' ? error : error.message;
+
+    // Ignore client-induced cancellations/aborts - do not penalize account
+    if (
+      errMsg.includes('AbortError') ||
+      errMsg.includes('This operation was aborted') ||
+      errMsg.includes('ERR_ABORTED') ||
+      errMsg.includes('The user aborted a request')
+    ) {
+      return;
+    }
+
     const now = new Date();
     const consecutive = account.consecutive_errors + 1;
     let newStatus: AccountStatus = account.status;

@@ -8,8 +8,9 @@ import {
   releaseProfileLock,
 } from './stealth-factory.js';
 import { normalizeCookieString } from '../../utils/cookie.js';
-import { encryptCookie } from '../../utils/crypto.js';
+import { encryptCookie, decryptCookie } from '../../utils/crypto.js';
 import { config } from '../../config.js';
+import { geminiAccountUrl } from '../gemini-adapter/gemini-web.js';
 
 export interface KeepAliveReport {
   isWorkerRunning: boolean;
@@ -185,10 +186,39 @@ export class KeepAliveWorker {
         timezone: account.timezone || 'America/New_York',
       });
 
+      // Pre-seed context with account's stored cookies if available
+      if (account.encrypted_cookie) {
+        try {
+          const raw = decryptCookie(account.encrypted_cookie, config.masterEncryptionKey);
+          const pairs = raw.split(';').map((p) => p.trim()).filter(Boolean);
+          const cookieList: any[] = [];
+          for (const pair of pairs) {
+            const eqIdx = pair.indexOf('=');
+            if (eqIdx > 0) {
+              const name = pair.slice(0, eqIdx).trim();
+              const value = pair.slice(eqIdx + 1).trim();
+              if (name && value) {
+                cookieList.push({
+                  name,
+                  value,
+                  url: 'https://gemini.google.com',
+                });
+              }
+            }
+          }
+          if (cookieList.length > 0) {
+            await context.addCookies(cookieList);
+          }
+        } catch (seedErr) {
+          console.warn('[KeepAliveWorker] Could not pre-seed cookies from database:', seedErr);
+        }
+      }
+
       const page = await context.newPage();
 
       // 2. Navigate to Gemini Web app
-      const response = await page.goto('https://gemini.google.com/app', {
+      const targetUrl = geminiAccountUrl('https://gemini.google.com/app', account.auth_user);
+      const response = await page.goto(targetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 45000,
       });

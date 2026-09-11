@@ -24,6 +24,7 @@ import {
   ShieldCheck,
   Check,
   RotateCw,
+  Loader2,
 } from 'lucide-react';
 import {
   fetchAccount,
@@ -270,7 +271,7 @@ export const AccountDetailPage: React.FC = () => {
 
   const handleTestSession = async () => {
     setTestingSession(true);
-    setActionFeedback(null);
+    setActionFeedback('Đang kết nối kiểm tra tài khoản Gemini...');
     try {
       const res = await testAccountSession(accountId);
       queryClient.invalidateQueries({ queryKey: ['account', accountId] });
@@ -454,7 +455,14 @@ export const AccountDetailPage: React.FC = () => {
       {/* Feedback Toast */}
       {actionFeedback && (
         <div className="p-3.5 rounded-xl bg-zinc-900 text-zinc-100 text-xs flex items-center justify-between shadow-sm">
-          <span>{actionFeedback}</span>
+          <div className="flex items-center gap-2">
+            {actionFeedback.startsWith('Đang') ? (
+              <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+            ) : (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            )}
+            <span>{actionFeedback}</span>
+          </div>
           <button onClick={() => setActionFeedback(null)} className="text-zinc-400 hover:text-white text-xs underline">
             Đóng
           </button>

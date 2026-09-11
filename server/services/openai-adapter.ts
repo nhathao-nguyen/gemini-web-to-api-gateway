@@ -31,8 +31,9 @@ export const ChatCompletionRequestSchema = z.object({
   upstream_cid: z.string().optional(),
   upstream_rid: z.string().optional(),
   upstream_rcid: z.string().optional(),
+  uploaded_files: z.array(z.object({ id: z.string(), name: z.string() })).optional(),
   thinking: z.boolean().optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'none']).optional(),
 });
 
 export const ImageGenerationRequestSchema = z.object({

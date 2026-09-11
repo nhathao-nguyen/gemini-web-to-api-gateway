@@ -441,15 +441,15 @@ export function parseGeminiQuotaResponse(rawBody: string): AccountQuotaInfo {
     }
     const date = new Date(sec * 1000);
     const iso = date.toISOString();
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mm = String(date.getMinutes()).padStart(2, '0');
+    const hh = String(date.getUTCHours()).padStart(2, '0');
+    const mm = String(date.getUTCMinutes()).padStart(2, '0');
 
     if (isWeekly) {
-      const dd = date.getDate();
-      const month = date.getMonth() + 1;
-      return { iso, label: `Đặt lại vào ${dd} thg ${month} lúc ${hh}:${mm}` };
+      const dd = date.getUTCDate();
+      const month = date.getUTCMonth() + 1;
+      return { iso, label: `Đặt lại vào ${dd} thg ${month} lúc ${hh}:${mm} UTC` };
     }
-    return { iso, label: `Đặt lại lúc ${hh}:${mm}` };
+    return { iso, label: `Đặt lại lúc ${hh}:${mm} UTC` };
   };
 
   const currentFormatted = formatResetTime(currentResetSeconds, false);
@@ -673,7 +673,6 @@ export function extractGeneratedImages(candidate: any[]): GeneratedMedia[] {
           const imageNode = rawImage[0];
           if (!Array.isArray(imageNode) || imageNode.length <= 3) continue;
           const metadata = imageNode[3];
-          console.log('[DEBUG candidateMedia rawImage]:', JSON.stringify(rawImage));
           if (!Array.isArray(metadata) || metadata.length <= 3) continue;
           const imageURL = metadata[3];
           if (typeof imageURL === 'string' && imageURL.trim()) {
@@ -813,8 +812,7 @@ export function parseGoogleWireResponse(rawBody: string): {
   }
 
   if (!found) {
-    const sample = rawBody.slice(0, 500);
-    throw new Error(`UPSTREAM_ERROR: Failed to parse response candidates from Gemini Web RPC. Sample: ${sample}`);
+    throw new Error('UPSTREAM_ERROR: Failed to parse response candidates from Gemini Web RPC (protocol envelope mismatch)');
   }
 
   const { thinking, text: cleanText } = extractThinkingAndText(finalResText);
@@ -1291,7 +1289,7 @@ export class GeminiWebProvider implements AIProvider {
     }
 
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(imageUrl, {
+    let res = await fetch(imageUrl, {
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
         'Referer': 'https://gemini.google.com/',
@@ -1299,6 +1297,17 @@ export class GeminiWebProvider implements AIProvider {
       },
       dispatcher,
     } as any);
+
+    if (!res.ok && (res.status === 403 || res.status === 401)) {
+      // Retry without Cookie header as Google User Content CDN often rejects session cookies
+      res = await fetch(imageUrl, {
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          'Referer': 'https://gemini.google.com/',
+        },
+        dispatcher,
+      } as any);
+    }
 
     if (!res.ok) {
       throw new Error(`Failed to download generated image: HTTP ${res.status}`);

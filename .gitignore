@@ -53,3 +53,4 @@ scratch/
 tmp/
 temp/
 *.tmp
+e2e_evidence/

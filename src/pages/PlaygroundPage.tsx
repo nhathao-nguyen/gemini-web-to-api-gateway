@@ -75,10 +75,10 @@ export const PlaygroundPage: React.FC = () => {
   // Model from URL param
   const modelParam = searchParams.get('model') || '';
 
-  // Manual key saved in sessionStorage
+  // Manual key saved in sessionStorage / localStorage
   const [manualKey, setManualKey] = useState<string>(() => {
     try {
-      return sessionStorage.getItem('gmgw_playground_key') || '';
+      return sessionStorage.getItem('gmgw_playground_key') || localStorage.getItem('gmgw_playground_key') || '';
     } catch {
       return '';
     }
@@ -141,6 +141,7 @@ export const PlaygroundPage: React.FC = () => {
   const [rawResponse, setRawResponse] = useState<any>(null);
   const [thinkingExpanded, setThinkingExpanded] = useState<Record<string, boolean>>({});
   const [copiedConv, setCopiedConv] = useState(false);
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null);
 
   // Streaming temp output
   const [streamingText, setStreamingText] = useState('');
@@ -228,6 +229,7 @@ export const PlaygroundPage: React.FC = () => {
     setManualKey(val);
     try {
       sessionStorage.setItem('gmgw_playground_key', val);
+      localStorage.setItem('gmgw_playground_key', val);
     } catch {}
   };
 
@@ -257,6 +259,11 @@ export const PlaygroundPage: React.FC = () => {
   const handleFileSelect = (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setErrorText(null);
+
+    if (Array.from(files).some((f) => f.size > 200 * 1024)) {
+      setUploadNotice('Đang đọc và chuẩn bị tệp tin gửi lên upstream Gemini...');
+      setTimeout(() => setUploadNotice(null), 3500);
+    }
 
     Array.from(files).forEach((file) => {
       if (file.size > 20 * 1024 * 1024) {
@@ -350,6 +357,7 @@ export const PlaygroundPage: React.FC = () => {
       // Build message content array if attachments exist
       let userMessageContent: any = currentPrompt;
       if (currentAttachments.length > 0) {
+        setUploadNotice('Đang tải tệp tin và kết nối upstream Gemini...');
         userMessageContent = [];
         if (currentPrompt) {
           userMessageContent.push({ type: 'text', text: currentPrompt });
@@ -536,6 +544,7 @@ export const PlaygroundPage: React.FC = () => {
       setErrorText(err.message || 'Error occurred while communicating with Gateway');
     } finally {
       setIsLoading(false);
+      setUploadNotice(null);
     }
   };
 
@@ -641,15 +650,17 @@ export const PlaygroundPage: React.FC = () => {
             </div>
 
             <div className="flex items-center justify-between p-3 bg-zinc-50 rounded-xl border border-zinc-200">
-              <div>
+              <label htmlFor="stream-toggle" className="cursor-pointer">
                 <span className="text-xs font-medium text-zinc-800 block">Stream SSE Chunks</span>
                 <span className="text-[11px] text-zinc-500">Incremental streaming & reasoning deltas</span>
-              </div>
+              </label>
               <input
+                id="stream-toggle"
+                name="stream-toggle"
                 type="checkbox"
                 checked={stream}
                 onChange={(e) => setStream(e.target.checked)}
-                className="w-4 h-4 rounded text-zinc-900 accent-zinc-900"
+                className="w-4 h-4 rounded text-zinc-900 accent-zinc-900 cursor-pointer"
               />
             </div>
 
@@ -898,6 +909,13 @@ export const PlaygroundPage: React.FC = () => {
             <div className="flex items-center justify-center gap-2 py-2 px-4 bg-amber-50 border-b border-amber-200 text-amber-900 text-xs font-medium">
               <Loader2 className="w-4 h-4 animate-spin text-amber-700" />
               <span>Đang tải lịch sử tin nhắn của đoạn chat từ Gemini Web...</span>
+            </div>
+          )}
+
+          {uploadNotice && (
+            <div className="flex items-center justify-center gap-2 py-2 px-4 bg-blue-50 border-b border-blue-200 text-blue-900 text-xs font-medium">
+              <Loader2 className="w-4 h-4 animate-spin text-blue-700" />
+              <span>{uploadNotice}</span>
             </div>
           )}
 

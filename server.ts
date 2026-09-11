@@ -55,8 +55,31 @@ async function startServer() {
   const HOST = config.host || '0.0.0.0';
 
   // Standard middleware
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+  // Handle JSON parsing errors and payload limits cleanly without process crash
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && 'status' in err && (err as any).status === 400 && 'body' in err) {
+      return res.status(400).json({
+        error: {
+          message: 'Invalid JSON payload received in request body.',
+          type: 'invalid_request_error',
+          code: 'invalid_json',
+        },
+      });
+    }
+    if (err.type === 'entity.too.large' || err.status === 413) {
+      return res.status(413).json({
+        error: {
+          message: 'Request payload exceeds the maximum allowed limit.',
+          type: 'invalid_request_error',
+          code: 'payload_too_large',
+        },
+      });
+    }
+    next(err);
+  });
 
   // CORS definitions
   // 1. Strict CORS for Admin routes - NEVER wildcard '*'
@@ -128,7 +151,19 @@ async function startServer() {
   // Vite middleware for frontend development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        watch: {
+          ignored: [
+            '**/browser-profiles/**',
+            '**/scratch/**',
+            '**/e2e_evidence/**',
+            '**/*.db*',
+            '**/*.sqlite*',
+            '**/node_modules/**',
+          ],
+        },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -152,7 +187,23 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, HOST, () => {
+  // Global Express error handler (must have 4 arguments)
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error(`[HTTP Error] ${req.method} ${req.path}:`, err?.message || err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    const statusCode = err.status || err.statusCode || 500;
+    res.status(statusCode).json({
+      error: {
+        message: err.message || 'Internal server error',
+        type: err.type || 'server_error',
+        code: err.code || 'internal_error',
+      },
+    });
+  });
+
+  const server = app.listen(PORT, HOST, () => {
     const lanIp = getLanIpv4();
     console.log(`====================================================`);
     console.log(`🚀 Gemini Web-to-API Gateway Server`);
@@ -167,6 +218,27 @@ async function startServer() {
       console.log(`📊 Health Endpoint:  http://localhost:${PORT}/health`);
     }
     console.log(`====================================================`);
+  });
+
+  const shutdown = async (signal: string) => {
+    console.log(`\n[Server] Received ${signal}. Shutting down gracefully...`);
+    keepAliveWorker.stop();
+    if (server) {
+      server.close();
+    }
+    db.close();
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  process.on('uncaughtException', (err) => {
+    console.error('[Process] Uncaught Exception:', err);
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('[Process] Unhandled Rejection at:', promise, 'reason:', reason);
   });
 }
 

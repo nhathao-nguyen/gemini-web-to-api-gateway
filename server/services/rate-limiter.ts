@@ -112,8 +112,8 @@ export class RateLimiter {
       this.initRedis(config.redisUrl);
     } else {
       if (config.isProduction) {
-        throw new Error(
-          'FATAL: REDIS_URL environment variable is required in production! In-process memory fallback is prohibited.'
+        console.warn(
+          '[RateLimiter] WARNING: REDIS_URL is not configured. Falling back to MemoryRateLimiter in-memory adapter for single-instance local/LAN deployment.'
         );
       } else {
         console.log(

@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js"
+    "clean": "node -e \"const fs=require('fs'); fs.rmSync('dist', {recursive:true,force:true}); fs.rmSync('server.js', {force:true});\""
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",

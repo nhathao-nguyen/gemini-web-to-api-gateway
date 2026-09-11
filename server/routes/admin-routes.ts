@@ -142,7 +142,21 @@ adminRouter.post('/auth/logout', (req: Request, res: Response) => {
 
 // Protected admin authentication middleware
 function adminAuth(req: Request, res: Response, next: () => void) {
-  // 1. Check HttpOnly session cookie
+  // 1. Check programmatic header authentication first (allows scripts/tools with secret to bypass cookie CSRF)
+  const authHeader = req.headers['authorization'];
+  const adminSecret =
+    req.headers['x-admin-key'] ||
+    req.headers['x-admin-password'] ||
+    (authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader);
+
+  if (config.adminApiKey && adminSecret === config.adminApiKey) {
+    return next();
+  }
+  if (config.adminPassword && adminSecret === config.adminPassword) {
+    return next();
+  }
+
+  // 2. Check HttpOnly session cookie
   const cookies = parseCookieHeader(req.headers.cookie);
   const sessionToken = cookies['admin_session'];
   const session = getAdminSession(sessionToken);
@@ -159,20 +173,6 @@ function adminAuth(req: Request, res: Response, next: () => void) {
       }
     }
     (req as any).adminSession = session;
-    return next();
-  }
-
-  // 2. Check programmatic header authentication (API keys/tokens for curl/scripts)
-  const authHeader = req.headers['authorization'];
-  const adminSecret =
-    req.headers['x-admin-key'] ||
-    req.headers['x-admin-password'] ||
-    (authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader);
-
-  if (config.adminApiKey && adminSecret === config.adminApiKey) {
-    return next();
-  }
-  if (config.adminPassword && adminSecret === config.adminPassword) {
     return next();
   }
 
