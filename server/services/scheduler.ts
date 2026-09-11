@@ -7,6 +7,14 @@ interface StickySessionEntry {
   expiresAt: number;
 }
 
+export const DEFAULT_GEMINI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.1-pro',
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.0-flash',
+];
+
 export class AccountScheduler {
   // In-flight active requests per account ID
   private activeRequests = new Map<string, number>();
@@ -34,6 +42,16 @@ export class AccountScheduler {
    * Bind conversation_id to account_id with TTL (default 30 mins)
    */
   public setStickySession(conversationId: string, accountId: string, ttlMs = 30 * 60 * 1000) {
+    // Prune expired sessions if map grows to avoid unbounded memory leak
+    if (this.stickySessions.size > 2000) {
+      const now = Date.now();
+      for (const [k, v] of this.stickySessions.entries()) {
+        if (now > v.expiresAt) {
+          this.stickySessions.delete(k);
+        }
+      }
+    }
+
     this.stickySessions.set(conversationId, {
       accountId,
       expiresAt: Date.now() + ttlMs,
@@ -152,6 +170,19 @@ export class AccountScheduler {
             if (m !== '*') modelSet.add(m);
           }
         }
+      }
+    }
+
+    // Fallback: If accounts exist and are active with unrestricted model access, provide default models
+    if (modelSet.size === 0) {
+      const hasActiveGeneralAccount = allAccounts.some(
+        (a) =>
+          a.status === 'ACTIVE' &&
+          !quotaManager.isCoolingDown(a) &&
+          (!a.supported_models || a.supported_models.length === 0 || a.supported_models.includes('*'))
+      );
+      if (hasActiveGeneralAccount) {
+        return [...DEFAULT_GEMINI_MODELS];
       }
     }
 

@@ -1,10 +1,11 @@
 import crypto from 'crypto';
 import { db } from '../db/database.js';
-import { GeminiAccount, AccountStatus } from '../types.js';
+import { GeminiAccount, AccountStatus, AccountQuotaInfo } from '../types.js';
 import { encryptCookie } from '../utils/crypto.js';
 import { normalizeCookieString, validateGeminiCookie } from '../utils/cookie.js';
 import { config } from '../config.js';
 import { geminiProvider } from './gemini-adapter/index.js';
+import { getProfileDir, cleanupProfileDir, DEFAULT_USER_AGENT } from './browser-manager/stealth-factory.js';
 
 export interface CreateAccountDTO {
   name: string;
@@ -14,6 +15,7 @@ export interface CreateAccountDTO {
   priority?: number;
   weight?: number;
   supported_models?: string[];
+  proxy_url?: string | null;
 }
 
 export class AccountManager {
@@ -52,6 +54,13 @@ export class AccountManager {
       priority: dto.priority ?? 10,
       weight: dto.weight ?? 1,
       supported_models: dto.supported_models && dto.supported_models.length > 0 ? dto.supported_models : [],
+      proxy_url: dto.proxy_url || null,
+      profile_dir: getProfileDir(id),
+      user_agent: DEFAULT_USER_AGENT,
+      locale: 'en-US',
+      timezone: 'America/New_York',
+      last_keepalive_at: now,
+      keepalive_status: 'IDLE',
       last_success_at: null,
       last_error_at: null,
       last_error: null,
@@ -125,7 +134,7 @@ export class AccountManager {
     return true;
   }
 
-  public async testSession(id: string): Promise<{ valid: boolean; error?: string; status: AccountStatus }> {
+  public async testSession(id: string): Promise<{ valid: boolean; error?: string; status: AccountStatus; models?: string[] }> {
     const account = db.getAccountById(id);
     if (!account) {
       return { valid: false, error: 'Account not found', status: 'ERROR' };
@@ -161,7 +170,20 @@ export class AccountManager {
       valid: health.valid,
       error: health.error,
       status: newStatus,
+      models: health.models,
     };
+  }
+
+  public updateAccount(id: string, updates: Partial<GeminiAccount>): Omit<GeminiAccount, 'encrypted_cookie'> | undefined {
+    const account = db.getAccountById(id);
+    if (!account) return undefined;
+
+    const { encrypted_cookie, id: _id, ...safeUpdates } = updates as any;
+    const updated = db.updateAccount(id, safeUpdates);
+    if (!updated) return undefined;
+
+    const { encrypted_cookie: _, ...safe } = updated;
+    return safe;
   }
 
   public deleteAccount(id: string): boolean {
@@ -170,6 +192,7 @@ export class AccountManager {
 
     const deleted = db.deleteAccount(id);
     if (deleted) {
+      cleanupProfileDir(id).catch((err) => console.warn(`Failed to cleanup profile dir for ${id}:`, err));
       db.addAccountEvent({
         id: `evt_${crypto.randomBytes(8).toString('hex')}`,
         account_id: id,
@@ -181,6 +204,14 @@ export class AccountManager {
       });
     }
     return deleted;
+  }
+
+  public async getAccountQuota(id: string): Promise<AccountQuotaInfo> {
+    const account = db.getAccountById(id);
+    if (!account) {
+      throw new Error(`Account ${id} not found`);
+    }
+    return geminiProvider.getAccountQuota(account);
   }
 }
 

@@ -12,8 +12,10 @@ import {
   buildGenerateInner,
   extractBardError,
   parseGoogleWireResponse,
+  parseGeminiQuotaResponse,
   DiscoveredModel,
   GEMINI_MODEL_HEADER_KEY,
+  GEMINI_USAGE_INFO_RPC,
 } from '../services/gemini-adapter/gemini-web.js';
 
 let passed = 0;
@@ -201,6 +203,30 @@ export async function runProtocolTests() {
     assert(err.message.includes('BardErrorInfo code 13 1152'), 'BardErrorInfo code 13 1152 properly detected and formatted');
   }
   assert(bardErrCaught, 'BardErrorInfo throws with diagnostic details');
+
+  // 9. Gemini Web Quota (jSf9Qc) Wire Parser
+  console.log('\n--- Suite 9: Gemini Web Quota (Usage Limits) RPC Parsing ---');
+  const sampleQuotaWire = `)]}'
+201
+[["wrb.fr","jSf9Qc","[2,[[47740,0.01329433,2,[[1789705625,968490000]]],[1778,0.26,1,[[1789122425,968397000]]]],false]",null,null,null,"generic"]]`;
+
+  const parsedQuota = parseGeminiQuotaResponse(sampleQuotaWire);
+  assert(parsedQuota.tier === 'PRO', 'Parsed tier as PRO');
+  assert(parsedQuota.current_usage_percent === 26, 'Parsed current usage percent as 26%');
+  assert(parsedQuota.current_reset_label.includes('Đặt lại lúc 17:27'), 'Parsed current reset time formatted correctly');
+  assert(parsedQuota.weekly_usage_percent === 1, 'Parsed weekly usage percent as 1%');
+  assert(parsedQuota.weekly_reset_label.includes('Đặt lại vào 18 thg 9 lúc 11:27'), 'Parsed weekly reset label formatted correctly');
+
+  // 10. Extended Thinking Mode Selection & Activation
+  console.log('\n--- Suite 10: Extended Thinking Mode Activation ---');
+  const standardInner = buildGenerateInner('solve puzzle', 3, 'vi', 'req-1', false, undefined, undefined, 1);
+  assert(standardInner[80] === 1, 'Standard mode sets inner[80] = 1');
+
+  const thinkingInner = buildGenerateInner('solve complex math', 3, 'vi', 'req-2', false, undefined, undefined, 2);
+  assert(thinkingInner[80] === 2, 'Extended thinking mode sets inner[80] = 2');
+
+  const proResolved = resolveGeminiModel('gemini-3.1-pro-thinking', discovered);
+  assert(proResolved.modelNumber === 3, 'gemini-3.1-pro-thinking correctly resolves to gemini-3.1-pro model');
 
   console.log(`\n========================================`);
   console.log(`🏁 Protocol Test Results: ${passed} Passed, ${failed} Failed`);

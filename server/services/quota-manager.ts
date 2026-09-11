@@ -34,7 +34,7 @@ export class QuotaManager {
     let cooldownUntil: string | null = null;
     let reason = errMsg;
 
-    if (errMsg.includes('SESSION_EXPIRED') || errMsg.includes('401') || errMsg.includes('403')) {
+    if (errMsg.includes('SESSION_EXPIRED') || errMsg.includes('upstream_auth_expired')) {
       newStatus = 'SESSION_EXPIRED';
       reason = 'Google Gemini session invalid or expired';
     } else if (errMsg.includes('QUOTA_EXHAUSTED') || errMsg.includes('429')) {
@@ -44,7 +44,7 @@ export class QuotaManager {
       cooldownUntil = cooldownDate.toISOString();
       reason = 'Upstream quota limit exceeded';
     } else {
-      // Temporary network or upstream 5xx error
+      // Temporary network or upstream error
       if (consecutive >= 3) {
         newStatus = 'COOLDOWN';
         // Short cooldown 3 minutes
@@ -52,7 +52,8 @@ export class QuotaManager {
         cooldownUntil = cooldownDate.toISOString();
         reason = `Repeated upstream errors (${consecutive} consecutive)`;
       } else {
-        newStatus = 'ERROR';
+        // Keep current status (ACTIVE) for isolated transient or client-induced errors
+        newStatus = account.status;
         reason = `Transient error: ${errMsg}`;
       }
     }

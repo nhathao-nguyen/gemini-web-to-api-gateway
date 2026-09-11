@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { setGlobalDispatcher, Agent, ProxyAgent, Dispatcher } from 'undici';
 import {
   AIProvider,
   AIProviderResult,
@@ -6,16 +7,50 @@ import {
   GeminiAccount,
   ChatCompletionRequest,
   HealthResult,
+  GeneratedMedia,
+  ModelCapabilities,
+  AccountQuotaInfo,
+  UpstreamConversation,
+  UpstreamChatTurn,
 } from '../../types.js';
 import { decryptCookie } from '../../utils/crypto.js';
 import { redactString } from '../../utils/redact.js';
 import { config } from '../../config.js';
+
+// Configure Undici global dispatcher with generous header buffer for Gemini Web large cookie payloads
+setGlobalDispatcher(
+  new Agent({
+    maxHeaderSize: 262144, // 256 KB
+    headersTimeout: 60000,
+  })
+);
+
+const proxyAgents = new Map<string, ProxyAgent>();
+
+export function getDispatcherForProxy(proxyUrl?: string | null): Dispatcher | undefined {
+  if (!proxyUrl || !proxyUrl.trim()) return undefined;
+  let normalized = proxyUrl.trim();
+  if (!normalized.includes('://')) {
+    normalized = `http://${normalized}`;
+  }
+  let agent = proxyAgents.get(normalized);
+  if (!agent) {
+    agent = new ProxyAgent({
+      uri: normalized,
+      maxHeaderSize: 262144,
+      headersTimeout: 60000,
+    });
+    proxyAgents.set(normalized, agent);
+  }
+  return agent;
+}
 
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 export const GEMINI_MODEL_HEADER_KEY = 'x-goog-ext-525001261-jspb';
 export const GEMINI_USER_STATUS_RPC = 'otAQ7b';
+export const GEMINI_USAGE_INFO_RPC = 'jSf9Qc';
 
 export interface DiscoveredModel {
   id: string; // canonical slug, e.g. "gemini-3.8-flash", "gemini-3.1-pro"
@@ -331,6 +366,107 @@ export function parseGeminiModels(bodyText: string): DiscoveredModel[] {
   return models;
 }
 
+export function parseGeminiQuotaResponse(rawBody: string): AccountQuotaInfo {
+  let cleaned = rawBody.trim();
+  if (cleaned.startsWith(")]}'")) {
+    cleaned = cleaned.slice(4).trim();
+  }
+
+  let rawPayload: any = null;
+  const lines = cleaned.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || /^\d+$/.test(trimmed)) continue;
+    try {
+      const parsed = JSON.parse(trimmed.replace(/^\)]\}'\s*/, ''));
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (Array.isArray(item) && item[1] === GEMINI_USAGE_INFO_RPC && item[2]) {
+            rawPayload = typeof item[2] === 'string' ? JSON.parse(item[2]) : item[2];
+            break;
+          }
+        }
+      }
+    } catch {
+      // ignore frame fragments
+    }
+    if (rawPayload) break;
+  }
+
+  if (!rawPayload && cleaned) {
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (Array.isArray(item) && item[1] === GEMINI_USAGE_INFO_RPC && item[2]) {
+            rawPayload = typeof item[2] === 'string' ? JSON.parse(item[2]) : item[2];
+            break;
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!rawPayload || !Array.isArray(rawPayload) || rawPayload.length < 2) {
+    throw new Error('Invalid or missing quota data in Gemini usage response');
+  }
+
+  const limitsArray = Array.isArray(rawPayload[1]) ? rawPayload[1] : [];
+  let currentUsage = 0;
+  let currentResetSeconds = 0;
+  let weeklyUsage = 0;
+  let weeklyResetSeconds = 0;
+
+  for (const limit of limitsArray) {
+    if (!Array.isArray(limit)) continue;
+    const ratio = typeof limit[1] === 'number' ? limit[1] : parseFloat(String(limit[1] || '0'));
+    const percent = Math.min(100, Math.max(0, Math.round(ratio * 100)));
+    const level = limit[2];
+    const resetTimeSec = limit[3]?.[0]?.[0] ? Number(limit[3][0][0]) : 0;
+
+    if (level === 1) {
+      currentUsage = percent;
+      currentResetSeconds = resetTimeSec;
+    } else if (level === 2) {
+      weeklyUsage = percent;
+      weeklyResetSeconds = resetTimeSec;
+    }
+  }
+
+  const formatResetTime = (sec: number, isWeekly: boolean): { iso: string; label: string } => {
+    if (!sec || isNaN(sec)) {
+      return { iso: '', label: 'Chưa xác định' };
+    }
+    const date = new Date(sec * 1000);
+    const iso = date.toISOString();
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mm = String(date.getMinutes()).padStart(2, '0');
+
+    if (isWeekly) {
+      const dd = date.getDate();
+      const month = date.getMonth() + 1;
+      return { iso, label: `Đặt lại vào ${dd} thg ${month} lúc ${hh}:${mm}` };
+    }
+    return { iso, label: `Đặt lại lúc ${hh}:${mm}` };
+  };
+
+  const currentFormatted = formatResetTime(currentResetSeconds, false);
+  const weeklyFormatted = formatResetTime(weeklyResetSeconds, true);
+
+  return {
+    tier: 'PRO',
+    current_usage_percent: currentUsage,
+    current_reset_at: currentFormatted.iso,
+    current_reset_label: currentFormatted.label,
+    weekly_usage_percent: weeklyUsage,
+    weekly_reset_at: weeklyFormatted.iso,
+    weekly_reset_label: weeklyFormatted.label,
+    fetched_at: new Date().toISOString(),
+  };
+}
+
 export function resolveGeminiModel(requested: string, models: DiscoveredModel[]): DiscoveredModel {
   if (!models || models.length === 0) {
     throw new Error('no Gemini models available; refresh the authenticated session');
@@ -342,6 +478,12 @@ export function resolveGeminiModel(requested: string, models: DiscoveredModel[])
   }
 
   let lookup = req;
+  if (lookup.endsWith('-thinking')) {
+    lookup = lookup.replace(/-thinking$/, '');
+  } else if (lookup.endsWith(':thinking')) {
+    lookup = lookup.replace(/:thinking$/, '');
+  }
+
   if (lookup === 'gemini-advanced') {
     lookup = 'gemini-pro';
   }
@@ -375,7 +517,8 @@ export function resolveGeminiModel(requested: string, models: DiscoveredModel[])
 export function buildGeminiModelHeaders(
   model: DiscoveredModel,
   requestId: string,
-  generationId: string
+  generationId: string,
+  thinkingMode = 1
 ): Record<string, string> {
   if (
     !model.modelId ||
@@ -394,7 +537,7 @@ export function buildGeminiModelHeaders(
   header[8] = [4, 5, 6, 8];
   header[model.capacityField - 1] = model.capacity;
   header[14 + offset] = model.modelNumber;
-  header[15 + offset] = 1;
+  header[15 + offset] = thinkingMode;
   header[16 + offset] = generationId;
 
   const requestHeader = [requestId, 1];
@@ -407,19 +550,34 @@ export function buildGeminiModelHeaders(
   };
 }
 
+export interface UploadedFileRef {
+  id: string; // e.g. "/contrib_service/files/..."
+  name: string;
+}
+
 export function buildGenerateInner(
   prompt: string,
   modelNumber: number,
   language: string,
   requestId: string,
   isTemporary = false,
-  metadata?: { cid?: string; rid?: string; rcid?: string }
+  metadata?: { cid?: string; rid?: string; rcid?: string },
+  files?: UploadedFileRef[],
+  thinkingMode = 1
 ): any[] {
-  const messageContent = [prompt];
+  let messageContent: any[];
+  if (!files || files.length === 0) {
+    messageContent = [prompt];
+  } else {
+    const fileData = files.map((f) => [[f.id], f.name]);
+    messageContent = [prompt, 0, null, fileData, null, null, 0];
+  }
+
+  const hasCid = Boolean(metadata?.cid && metadata.cid.trim());
   const defaultMetadata = [
-    metadata?.cid || '',
-    metadata?.rid || '',
-    metadata?.rcid || '',
+    hasCid ? metadata!.cid!.trim() : '',
+    hasCid ? (metadata?.rid || '') : '',
+    hasCid ? (metadata?.rcid || '') : '',
     null,
     null,
     null,
@@ -447,7 +605,7 @@ export function buildGenerateInner(
   inner[61] = [];
   inner[68] = 1;
   inner[79] = modelNumber;
-  inner[80] = 1;
+  inner[80] = thinkingMode;
 
   if (isTemporary) {
     inner[45] = 1;
@@ -488,6 +646,9 @@ export function extractBardError(item: any): string | null {
   }
 
   if (foundError) {
+    if (codes.includes(1003)) {
+      return `Google Gemini Web returned an error (BardErrorInfo code 3 1003): Invalid or non-existent conversation ID. Upstream conversation thread was not found on Google servers. Please clear the Conversation ID or start a new chat.`;
+    }
     if (codes.length > 0) {
       return `Google Gemini Web returned an error (BardErrorInfo code ${codes.join(' ')}). This usually indicates session expiration, rate limits, context window limits, or bot protection/CAPTCHA block.`;
     }
@@ -496,12 +657,78 @@ export function extractBardError(item: any): string | null {
   return null;
 }
 
+export function extractGeneratedImages(candidate: any[]): GeneratedMedia[] {
+  const images: GeneratedMedia[] = [];
+  if (!Array.isArray(candidate)) return images;
+
+  // 1. Dedicated Gemini Web generated-media candidate slot at candidate[12][7][0]
+  if (candidate.length > 12 && Array.isArray(candidate[12])) {
+    const candidateMedia = candidate[12];
+    if (candidateMedia.length > 7 && Array.isArray(candidateMedia[7])) {
+      const mediaGroups = candidateMedia[7];
+      if (mediaGroups.length > 0 && Array.isArray(mediaGroups[0])) {
+        const generated = mediaGroups[0];
+        for (const rawImage of generated) {
+          if (!Array.isArray(rawImage) || rawImage.length === 0) continue;
+          const imageNode = rawImage[0];
+          if (!Array.isArray(imageNode) || imageNode.length <= 3) continue;
+          const metadata = imageNode[3];
+          console.log('[DEBUG candidateMedia rawImage]:', JSON.stringify(rawImage));
+          if (!Array.isArray(metadata) || metadata.length <= 3) continue;
+          const imageURL = metadata[3];
+          if (typeof imageURL === 'string' && imageURL.trim()) {
+            const filename = typeof metadata[2] === 'string' ? metadata[2] : 'generated_image.png';
+            let mimeType = 'image/png';
+            let width: number | undefined;
+            let height: number | undefined;
+            for (const field of metadata) {
+              if (typeof field === 'string' && field.startsWith('image/')) {
+                mimeType = field;
+              } else if (Array.isArray(field) && field.length >= 2) {
+                if (typeof field[0] === 'number') width = field[0];
+                if (typeof field[1] === 'number') height = field[1];
+              }
+            }
+            images.push({
+              url: imageURL.trim(),
+              title: filename,
+              mime_type: mimeType,
+              width,
+              height,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Scan candidate structure for googleusercontent image URLs
+  const candidateStr = JSON.stringify(candidate);
+  const urlRegex = /https:\/\/[a-zA-Z0-9.\-]+\.googleusercontent\.com\/[^\s"',\])}]+/g;
+  const matches = candidateStr.match(urlRegex);
+  if (matches) {
+    for (const match of matches) {
+      const cleanUrl = match.replace(/\\u003d/g, '=').replace(/\\/g, '');
+      if (!images.some((img) => img.url === cleanUrl)) {
+        images.push({
+          url: cleanUrl,
+          title: 'generated_image.png',
+          mime_type: 'image/png',
+        });
+      }
+    }
+  }
+
+  return images;
+}
+
 export function parseGoogleWireResponse(rawBody: string): {
   text: string;
   thinking?: string;
   conversation_id?: string;
   response_id?: string;
   choice_id?: string;
+  images?: GeneratedMedia[];
 } {
   const cleaned = rawBody.replace(/^\)]\}'\s*/, '');
   const lines = cleaned.split('\n');
@@ -511,6 +738,7 @@ export function parseGoogleWireResponse(rawBody: string): {
   let rid = '';
   let rcid = '';
   let found = false;
+  let images: GeneratedMedia[] = [];
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -551,8 +779,20 @@ export function parseGoogleWireResponse(rawBody: string): {
                     if (typeof firstCandidate[0] === 'string') {
                       rcid = firstCandidate[0];
                     }
-                    if (typeof payload[1] === 'string') {
+                    if (Array.isArray(payload[1])) {
+                      if (payload[1][0]) cid = payload[1][0];
+                      if (payload[1][1]) rid = payload[1][1];
+                    } else if (typeof payload[1] === 'string') {
                       cid = payload[1];
+                    }
+                    if (!rid && typeof payload[2]?.[18] === 'string') {
+                      rid = payload[2][18];
+                    }
+
+                    // Extract structured generated images
+                    const extracted = extractGeneratedImages(firstCandidate);
+                    if (extracted.length > 0) {
+                      images = extracted;
                     }
 
                     finalResText = resText;
@@ -585,8 +825,10 @@ export function parseGoogleWireResponse(rawBody: string): {
     conversation_id: cid || undefined,
     response_id: rid || undefined,
     choice_id: rcid || undefined,
+    images: images.length > 0 ? images : undefined,
   };
 }
+
 
 // --------------------------------------------------------------------------
 // GeminiWebProvider Implementation
@@ -623,6 +865,7 @@ export class GeminiWebProvider implements AIProvider {
     const targetUrl = geminiAccountUrl('https://gemini.google.com/app', account.auth_user) + '?hl=en';
 
     const fetchStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
     const res = await fetch(targetUrl, {
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
@@ -640,7 +883,8 @@ export class GeminiWebProvider implements AIProvider {
         'X-Same-Domain': '1',
       },
       redirect: 'manual',
-    });
+      dispatcher,
+    } as any);
 
     console.log(`[Upstream Gemini Web Handshake] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/app upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -688,36 +932,15 @@ export class GeminiWebProvider implements AIProvider {
     const generationId = crypto.randomUUID().toUpperCase();
 
     // Discover models via otAQ7b RPC
-    let discoveredModels: DiscoveredModel[] = [];
-    try {
-      discoveredModels = await this.fetchGeminiModels(
-        account,
-        snlm0e,
-        cookie,
-        buildLabel,
-        sessionId,
-        language,
-        generationId
-      );
-    } catch (discoveryErr: any) {
-      console.warn(`[GeminiWebProvider] Model discovery warning for account ${account.id}: ${discoveryErr.message}`);
-      // If live discovery failed, fall back to account.supported_models or default models
-      const fallbackList = account.supported_models && account.supported_models.length > 0
-        ? account.supported_models
-        : ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-advanced'];
-      discoveredModels = fallbackList.map((m) => {
-        const { name, aliases } = geminiModelNames(m, m.includes('pro') ? 'Pro' : 'Fast', m);
-        return {
-          id: name,
-          displayName: m,
-          modelId: `fallback-${m}`,
-          capacity: 1,
-          capacityField: 12,
-          modelNumber: 1,
-          aliases,
-        };
-      });
-    }
+    const discoveredModels = await this.fetchGeminiModels(
+      account,
+      snlm0e,
+      cookie,
+      buildLabel,
+      sessionId,
+      language,
+      generationId
+    );
 
     const session: GeminiWebSession = {
       snlm0e,
@@ -771,6 +994,7 @@ export class GeminiWebProvider implements AIProvider {
     ) + '?' + query.toString();
 
     const fetchStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
     const res = await fetch(targetUrl, {
       method: 'POST',
       headers: {
@@ -784,7 +1008,8 @@ export class GeminiWebProvider implements AIProvider {
         'x-goog-ext-73010989-jspb': '[0]',
       },
       body: form.toString(),
-    });
+      dispatcher,
+    } as any);
 
     console.log(`[Upstream Gemini Web Discovery] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -820,6 +1045,59 @@ export class GeminiWebProvider implements AIProvider {
     }
   }
 
+  public async fetchAccountQuota(account: GeminiAccount): Promise<AccountQuotaInfo> {
+    const session = await this.getOrFetchSession(account);
+
+    const query = new URLSearchParams({
+      rpcids: GEMINI_USAGE_INFO_RPC,
+      hl: session.language || 'vi',
+      _reqid: String(Math.floor(Math.random() * 90000) + 10000),
+      rt: 'c',
+      'source-path': geminiSourcePath(account.auth_user),
+    });
+
+    if (session.buildLabel) query.set('bl', session.buildLabel);
+    if (session.sessionId) query.set('f.sid', session.sessionId);
+
+    const form = new URLSearchParams();
+    form.append('at', session.snlm0e);
+    form.append('f.req', `[[["${GEMINI_USAGE_INFO_RPC}","[]",null,"generic"]]]`);
+
+    const targetUrl = geminiAccountUrl(
+      'https://gemini.google.com/_/BardChatUi/data/batchexecute',
+      account.auth_user
+    ) + '?' + query.toString();
+
+    const fetchStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': BROWSER_USER_AGENT,
+        'Cookie': session.cookieHeader,
+        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+        'Origin': 'https://gemini.google.com',
+        'Referer': 'https://gemini.google.com/',
+        'X-Same-Domain': '1',
+      },
+      body: form.toString(),
+      dispatcher,
+    } as any);
+
+    console.log(`[Upstream Gemini Web Quota] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
+
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        this.sessionCache.delete(account.id);
+        throw new Error(`SESSION_EXPIRED: Upstream returned HTTP ${res.status}`);
+      }
+      throw new Error(`Failed to fetch Gemini account quota with HTTP status ${res.status}`);
+    }
+
+    const text = await res.text();
+    return parseGeminiQuotaResponse(text);
+  }
+
   public async ListModels(account: GeminiAccount): Promise<string[]> {
     if (account.supported_models && account.supported_models.length > 0) {
       return account.supported_models;
@@ -831,18 +1109,72 @@ export class GeminiWebProvider implements AIProvider {
     return [];
   }
 
-  private buildPromptFromMessages(messages: ChatCompletionRequest['messages']): { prompt: string; systemPrompt?: string } {
+  public parseDataUrl(url: string, defaultName: string): { name: string; mimeType: string; data: Buffer } | null {
+    if (!url.startsWith('data:')) return null;
+    const match = url.match(/^data:([^;]+);base64,(.*)$/);
+    if (!match) return null;
+    const mimeType = match[1];
+    const base64Data = match[2];
+    const buffer = Buffer.from(base64Data, 'base64');
+    let ext = '.bin';
+    if (mimeType.includes('png')) ext = '.png';
+    else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = '.jpg';
+    else if (mimeType.includes('webp')) ext = '.webp';
+    else if (mimeType.includes('gif')) ext = '.gif';
+    else if (mimeType.includes('pdf')) ext = '.pdf';
+    else if (mimeType.includes('csv')) ext = '.csv';
+    else if (mimeType.includes('plain')) ext = '.txt';
+
+    const filename = defaultName.includes('.') ? defaultName : `${defaultName}${ext}`;
+    return { name: filename, mimeType, data: buffer };
+  }
+
+  public buildPromptAndAttachments(messages: ChatCompletionRequest['messages']): {
+    prompt: string;
+    systemPrompt?: string;
+    attachments: Array<{ name: string; mimeType: string; data: Buffer }>;
+  } {
     let systemPrompt = '';
     const promptParts: string[] = [];
+    const attachments: Array<{ name: string; mimeType: string; data: Buffer }> = [];
 
-    for (const msg of messages) {
-      const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      let textContent = '';
+
+      if (typeof msg.content === 'string') {
+        textContent = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        for (let j = 0; j < msg.content.length; j++) {
+          const part: any = msg.content[j];
+          if (!part) continue;
+          if (part.type === 'text' && typeof part.text === 'string') {
+            textContent += (textContent ? '\n' : '') + part.text;
+          } else if (part.type === 'image_url' && part.image_url?.url) {
+            const parsed = this.parseDataUrl(part.image_url.url, `attachment_${i}_${j}`);
+            if (parsed) attachments.push(parsed);
+          } else if (part.type === 'file_url' && part.file_url?.url) {
+            const parsed = this.parseDataUrl(part.file_url.url, part.file_url.name || `attachment_${i}_${j}`);
+            if (parsed) attachments.push(parsed);
+          } else if (part.type === 'file' && part.file) {
+            if (part.file.data) {
+              const buffer = Buffer.from(part.file.data, 'base64');
+              attachments.push({
+                name: part.file.name || `attachment_${i}_${j}`,
+                mimeType: part.file.mime_type || 'application/octet-stream',
+                data: buffer,
+              });
+            }
+          }
+        }
+      }
+
       if (msg.role === 'system') {
-        systemPrompt += (systemPrompt ? '\n' : '') + content;
+        systemPrompt += (systemPrompt ? '\n' : '') + textContent;
       } else if (msg.role === 'user') {
-        promptParts.push(`User: ${content}`);
+        promptParts.push(`User: ${textContent}`);
       } else if (msg.role === 'assistant') {
-        promptParts.push(`Assistant: ${content}`);
+        promptParts.push(`Assistant: ${textContent}`);
       }
     }
 
@@ -851,20 +1183,183 @@ export class GeminiWebProvider implements AIProvider {
       finalPrompt = `[System Instructions]\n${systemPrompt}\n\n${finalPrompt}`;
     }
 
-    return { prompt: finalPrompt, systemPrompt };
+    return { prompt: finalPrompt, systemPrompt, attachments };
+  }
+
+  public async uploadFile(
+    account: GeminiAccount,
+    filename: string,
+    mimeType: string,
+    data: Buffer
+  ): Promise<UploadedFileRef> {
+    const session = await this.getOrFetchSession(account);
+    const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
+
+    const startHeaders: Record<string, string> = {
+      'Accept': '*/*',
+      'Authorization': 'Basic c2F2ZXM6cyNMdGhlNmxzd2F2b0RsN3J1d1U=',
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      'Origin': 'https://gemini.google.com',
+      'Referer': 'https://gemini.google.com/',
+      'Push-ID': session.pushId || 'feeds/mcudyrk2a4khkz',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(data.length),
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Tenant-Id': 'bard-storage',
+      'User-Agent': BROWSER_USER_AGENT,
+      'Size': String(data.length),
+      'Cookie': session.cookieHeader,
+    };
+
+    const uploadStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
+    // 1. OPTIONS request
+    await fetch('https://content-push.googleapis.com/upload', {
+      method: 'OPTIONS',
+      headers: startHeaders,
+      dispatcher,
+    } as any).catch(() => {});
+
+    // 2. POST start
+    const startRes = await fetch('https://content-push.googleapis.com/upload', {
+      method: 'POST',
+      headers: startHeaders,
+      body: 'File name: ' + sanitizedFilename,
+      dispatcher,
+    } as any);
+
+    if (!startRes.ok) {
+      throw new Error(`Upstream upload initialization failed: HTTP ${startRes.status}`);
+    }
+
+    const uploadUrl = startRes.headers.get('x-goog-upload-url');
+    if (!uploadUrl) {
+      throw new Error('Upstream upload initialization failed: missing X-Goog-Upload-Url header');
+    }
+
+    // 3. OPTIONS to uploadUrl
+    await fetch(uploadUrl, {
+      method: 'OPTIONS',
+      headers: startHeaders,
+      dispatcher,
+    } as any).catch(() => {});
+
+    // 4. POST file bytes & finalize
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Accept': '*/*',
+        'Authorization': 'Basic c2F2ZXM6cyNMdGhlNmxzd2F2b0RsN3J1d1U=',
+        'Content-Type': mimeType || 'application/octet-stream',
+        'Origin': 'https://gemini.google.com',
+        'Referer': 'https://gemini.google.com/',
+        'Push-ID': session.pushId || 'feeds/mcudyrk2a4khkz',
+        'X-Goog-Upload-Command': 'upload, finalize',
+        'X-Goog-Upload-Offset': '0',
+        'X-Tenant-Id': 'bard-storage',
+        'User-Agent': BROWSER_USER_AGENT,
+        'Cookie': session.cookieHeader,
+      },
+      body: new Uint8Array(data),
+      dispatcher,
+    } as any);
+
+
+    if (!uploadRes.ok) {
+      throw new Error(`Upstream file upload failed: HTTP ${uploadRes.status}`);
+    }
+
+    const fileId = (await uploadRes.text()).trim();
+    if (!fileId) {
+      throw new Error('Upstream file upload returned empty file ID');
+    }
+
+    console.log(`[Upstream Gemini Web Upload] account_id=${account.id} upstream_hostname=content-push.googleapis.com upstream_path=/upload file_name="${sanitizedFilename}" file_id="${fileId}" duration_ms=${Date.now() - uploadStart}`);
+
+    return { id: fileId, name: sanitizedFilename };
+  }
+
+  public async downloadGeneratedImage(
+    account: GeminiAccount,
+    rawUrl: string,
+    targetSize = 2048
+  ): Promise<{ data: Buffer; mimeType: string }> {
+    const session = await this.getOrFetchSession(account);
+    let imageUrl = rawUrl;
+    if (!imageUrl.includes('=s') && !imageUrl.includes('=w')) {
+      imageUrl = imageUrl.replace(/(\?|#|$)/, `=s${targetSize}$1`);
+    }
+
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
+    const res = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': BROWSER_USER_AGENT,
+        'Referer': 'https://gemini.google.com/',
+        'Cookie': session.cookieHeader,
+      },
+      dispatcher,
+    } as any);
+
+    if (!res.ok) {
+      throw new Error(`Failed to download generated image: HTTP ${res.status}`);
+    }
+
+    const mimeType = res.headers.get('content-type') || 'image/png';
+    const arrayBuffer = await res.arrayBuffer();
+    return { data: Buffer.from(arrayBuffer), mimeType };
+  }
+
+  public getModelCapabilities(modelId: string): ModelCapabilities {
+    const id = modelId.toLowerCase();
+    const isPro = id.includes('pro');
+    const isFlash = id.includes('flash');
+    const isThinking = id.includes('thinking') || isPro;
+
+    return {
+      text: true,
+      vision: true,
+      files: true,
+      thinking: isThinking,
+      image_generation: isPro || isFlash,
+      video_generation: false, // Standard Gemini Web does not expose video generation
+    };
   }
 
   private async executeRpc(
     account: GeminiAccount,
     request: ChatCompletionRequest,
     signal?: AbortSignal
-  ): Promise<{ res: Response; model: DiscoveredModel }> {
+  ): Promise<{ res: Response; model: DiscoveredModel; images?: GeneratedMedia[] }> {
     const session = await this.getOrFetchSession(account);
     const resolvedModel = resolveGeminiModel(request.model, session.discoveredModels);
 
-    const { prompt } = this.buildPromptFromMessages(request.messages);
+    const { prompt, attachments } = this.buildPromptAndAttachments(request.messages);
+    const uploadedFiles: UploadedFileRef[] = request.uploaded_files ? [...request.uploaded_files] : [];
+
+    // Upload inline attachments upstream
+    for (const att of attachments) {
+      const uploaded = await this.uploadFile(account, att.name, att.mimeType, att.data);
+      uploadedFiles.push(uploaded);
+    }
+
     const requestId = crypto.randomUUID().toUpperCase();
     const isTemporary = false;
+
+    // Pass native Gemini conversation state if available (only real upstream c_ IDs, never local conv_ IDs or arbitrary test inputs like '123')
+    const rawCid = (request.upstream_cid || request.conversation_id || '').trim();
+    const nativeCid = rawCid.startsWith('c_') ? rawCid : undefined;
+
+    const metadata = {
+      cid: nativeCid,
+      rid: request.upstream_rid,
+      rcid: request.upstream_rcid,
+    };
+
+    const wantsThinking =
+      request.thinking === true ||
+      request.model.toLowerCase().includes('thinking') ||
+      (Boolean(request.reasoning_effort) && request.reasoning_effort !== 'none');
+    const thinkingMode = wantsThinking ? 2 : 1;
 
     const innerReq = buildGenerateInner(
       prompt,
@@ -872,11 +1367,13 @@ export class GeminiWebProvider implements AIProvider {
       session.language || 'en',
       requestId,
       isTemporary,
-      { cid: request.conversation_id }
+      metadata,
+      uploadedFiles,
+      thinkingMode
     );
 
     const fReq = JSON.stringify([null, JSON.stringify(innerReq)]);
-    const modelHeaders = buildGeminiModelHeaders(resolvedModel, requestId, session.generationId);
+    const modelHeaders = buildGeminiModelHeaders(resolvedModel, requestId, session.generationId, thinkingMode);
 
     const query = new URLSearchParams({
       at: session.snlm0e,
@@ -911,12 +1408,14 @@ export class GeminiWebProvider implements AIProvider {
     };
 
     const fetchStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
     const res = await fetch(rpcUrl, {
       method: 'POST',
       headers,
       body: bodyParams.toString(),
       signal,
-    });
+      dispatcher,
+    } as any);
 
     console.log(`[Upstream Gemini Web RPC] request_id=${requestId} account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -953,6 +1452,7 @@ export class GeminiWebProvider implements AIProvider {
       conversation_id: parsed.conversation_id,
       response_id: parsed.response_id,
       choice_id: parsed.choice_id,
+      images: parsed.images,
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
     };
@@ -978,6 +1478,8 @@ export class GeminiWebProvider implements AIProvider {
     let emittedThinking = '';
     let convId: string | undefined;
     let respId: string | undefined;
+    let choiceId: string | undefined;
+    let capturedImages: GeneratedMedia[] = [];
     let upstreamFirstChunkTs: number | null = null;
     let downstreamFirstChunkTs: number | null = null;
 
@@ -1033,8 +1535,24 @@ export class GeminiWebProvider implements AIProvider {
                         if (Array.isArray(contentParts) && contentParts.length > 0) {
                           const rawCandidateText = contentParts[0];
                           if (typeof rawCandidateText === 'string') {
-                            if (typeof payload[1] === 'string') convId = payload[1];
-                            if (typeof firstCandidate[0] === 'string') respId = firstCandidate[0];
+                            if (typeof firstCandidate[0] === 'string') {
+                              choiceId = firstCandidate[0];
+                            }
+                            if (Array.isArray(payload[1])) {
+                              if (payload[1][0]) convId = payload[1][0];
+                              if (payload[1][1]) respId = payload[1][1];
+                            } else if (typeof payload[1] === 'string') {
+                              convId = payload[1];
+                            }
+                            if (!respId && typeof payload[2]?.[18] === 'string') {
+                              respId = payload[2][18];
+                            }
+
+                            // Extract structured generated images
+                            const extracted = extractGeneratedImages(firstCandidate);
+                            if (extracted.length > 0) {
+                              capturedImages = extracted;
+                            }
 
                             const { thinking, text } = extractThinkingAndText(rawCandidateText);
 
@@ -1054,6 +1572,7 @@ export class GeminiWebProvider implements AIProvider {
                                 is_done: false,
                                 conversation_id: convId,
                                 response_id: respId,
+                                choice_id: choiceId,
                               };
                             }
 
@@ -1072,6 +1591,7 @@ export class GeminiWebProvider implements AIProvider {
                                 is_done: false,
                                 conversation_id: convId,
                                 response_id: respId,
+                                choice_id: choiceId,
                               };
                             }
                           }
@@ -1107,6 +1627,279 @@ export class GeminiWebProvider implements AIProvider {
       is_done: true,
       conversation_id: convId,
       response_id: respId,
+      choice_id: choiceId,
+      images: capturedImages.length > 0 ? capturedImages : undefined,
     };
   }
+
+  public async fetchRecentConversations(account: GeminiAccount, limit = 10): Promise<UpstreamConversation[]> {
+    const session = await this.getOrFetchSession(account);
+
+    const query = new URLSearchParams({
+      rpcids: 'MaZiqc',
+      hl: session.language || 'vi',
+      _reqid: String(Math.floor(Math.random() * 90000) + 10000),
+      rt: 'c',
+      'source-path': geminiSourcePath(account.auth_user),
+    });
+
+    if (session.buildLabel) query.set('bl', session.buildLabel);
+    if (session.sessionId) query.set('f.sid', session.sessionId);
+
+    const reqPayload = JSON.stringify([limit, null, [0, null, 1]]);
+    const form = new URLSearchParams({
+      at: session.snlm0e,
+      'f.req': JSON.stringify([[["MaZiqc", reqPayload, null, "generic"]]]),
+    });
+
+    const targetUrl = geminiAccountUrl(
+      'https://gemini.google.com/_/BardChatUi/data/batchexecute',
+      account.auth_user
+    ) + '?' + query.toString();
+
+    const fetchStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': BROWSER_USER_AGENT,
+        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+        'Origin': 'https://gemini.google.com',
+        'Referer': 'https://gemini.google.com/',
+        'X-Same-Domain': '1',
+        'Cookie': session.cookieHeader,
+      },
+      body: form.toString(),
+      dispatcher,
+    } as any);
+
+    console.log(`[Upstream Gemini Web ListConversations] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
+
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        this.sessionCache.delete(account.id);
+        throw new Error(`SESSION_EXPIRED: Upstream returned HTTP ${res.status}`);
+      }
+      throw new Error(`Failed to fetch recent conversations: HTTP ${res.status}`);
+    }
+
+    const text = await res.text();
+    return parseGeminiRecentConversations(text);
+  }
+
+  public async fetchConversationHistory(
+    account: GeminiAccount,
+    conversationId: string
+  ): Promise<{ turns: UpstreamChatTurn[]; lastRid?: string; lastRcid?: string }> {
+    const session = await this.getOrFetchSession(account);
+
+    const query = new URLSearchParams({
+      rpcids: 'hNvQHb',
+      hl: session.language || 'vi',
+      _reqid: String(Math.floor(Math.random() * 90000) + 10000),
+      rt: 'c',
+      'source-path': geminiSourcePath(account.auth_user),
+    });
+
+    if (session.buildLabel) query.set('bl', session.buildLabel);
+    if (session.sessionId) query.set('f.sid', session.sessionId);
+
+    const reqPayload = JSON.stringify([conversationId, 25, null, 1]);
+    const form = new URLSearchParams({
+      at: session.snlm0e,
+      'f.req': JSON.stringify([[["hNvQHb", reqPayload, null, "generic"]]]),
+    });
+
+    const targetUrl = geminiAccountUrl(
+      'https://gemini.google.com/_/BardChatUi/data/batchexecute',
+      account.auth_user
+    ) + '?' + query.toString();
+
+    const fetchStart = Date.now();
+    const dispatcher = getDispatcherForProxy(account.proxy_url);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': BROWSER_USER_AGENT,
+        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+        'Origin': 'https://gemini.google.com',
+        'Referer': 'https://gemini.google.com/',
+        'X-Same-Domain': '1',
+        'Cookie': session.cookieHeader,
+      },
+      body: form.toString(),
+      dispatcher,
+    } as any);
+
+    console.log(`[Upstream Gemini Web ReadConversation] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
+
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        this.sessionCache.delete(account.id);
+        throw new Error(`SESSION_EXPIRED: Upstream returned HTTP ${res.status}`);
+      }
+      throw new Error(`Failed to fetch conversation history: HTTP ${res.status}`);
+    }
+
+    const text = await res.text();
+    return parseGeminiConversationHistory(text);
+  }
 }
+
+export function parseGeminiRecentConversations(bodyText: string): UpstreamConversation[] {
+  let cleaned = bodyText.trim();
+  if (cleaned.startsWith(")]}'")) {
+    cleaned = cleaned.slice(4).trim();
+  }
+
+  const results: UpstreamConversation[] = [];
+  const lines = cleaned.split('\n');
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || /^\d+$/.test(trimmed)) continue;
+    try {
+      const parsed = JSON.parse(trimmed.replace(/^\)]\}'\s*/, ''));
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (Array.isArray(item) && item[1] === 'MaZiqc' && item[2]) {
+            const data = typeof item[2] === 'string' ? JSON.parse(item[2]) : item[2];
+            if (Array.isArray(data) && Array.isArray(data[2])) {
+              for (const conv of data[2]) {
+                if (Array.isArray(conv) && conv.length >= 2) {
+                  const id = conv[0]; // e.g. "c_c73b1db28bf040bd"
+                  const title = typeof conv[1] === 'string' ? conv[1] : 'Cuộc trò chuyện mới';
+                  let timestampSeconds = 0;
+                  if (Array.isArray(conv[5]) && typeof conv[5][0] === 'number') {
+                    timestampSeconds = conv[5][0];
+                  }
+                  const choiceId = typeof conv[21] === 'string' ? conv[21] : undefined;
+                  const updatedAt = timestampSeconds
+                    ? new Date(timestampSeconds * 1000).toISOString()
+                    : new Date().toISOString();
+
+                  results.push({
+                    id,
+                    title,
+                    updated_at: updatedAt,
+                    timestamp_seconds: timestampSeconds,
+                    choice_id: choiceId,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return results;
+}
+
+export function parseGeminiConversationHistory(bodyText: string): {
+  turns: UpstreamChatTurn[];
+  lastRid?: string;
+  lastRcid?: string;
+} {
+  let cleaned = bodyText.trim();
+  if (cleaned.startsWith(")]}'")) {
+    cleaned = cleaned.slice(4).trim();
+  }
+
+  const turns: UpstreamChatTurn[] = [];
+  let lastRid: string | undefined;
+  let lastRcid: string | undefined;
+  const lines = cleaned.split('\n');
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || /^\d+$/.test(trimmed)) continue;
+    try {
+      const parsed = JSON.parse(trimmed.replace(/^\)]\}'\s*/, ''));
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (Array.isArray(item) && item[1] === 'hNvQHb' && item[2]) {
+            const data = typeof item[2] === 'string' ? JSON.parse(item[2]) : item[2];
+            if (Array.isArray(data) && Array.isArray(data[0])) {
+              const rawItems = data[0]; // List of messages ordered newest to oldest
+              if (rawItems.length > 0) {
+                const newest = rawItems[0];
+                if (Array.isArray(newest[0]) && newest[0][1]) {
+                  lastRid = newest[0][1];
+                }
+                if (Array.isArray(newest[3]) && newest[3][0]?.[0]?.[0]) {
+                  lastRcid = newest[3][0][0][0];
+                } else if (typeof newest[3]?.[3] === 'string') {
+                  lastRcid = newest[3][3];
+                }
+              }
+
+              // Reverse to make chronological (oldest to newest)
+              const chronological = [...rawItems].reverse();
+              for (const turnItem of chronological) {
+                if (!Array.isArray(turnItem)) continue;
+
+                // 1. User turn
+                let userText = '';
+                if (Array.isArray(turnItem[2]) && Array.isArray(turnItem[2][0])) {
+                  const rawUserText = turnItem[2][0][0] || '';
+                  userText = typeof rawUserText === 'string' ? rawUserText.replace(/^User:\s*/i, '') : '';
+                }
+
+                if (userText) {
+                  turns.push({
+                    role: 'user',
+                    content: userText,
+                  });
+                }
+
+                // 2. Assistant turn
+                let asstText = '';
+                let asstReasoning = '';
+                let asstChoiceId: string | undefined;
+                let asstRespId: string | undefined;
+
+                if (Array.isArray(turnItem[0]) && turnItem[0][1]) {
+                  asstRespId = turnItem[0][1];
+                }
+
+                if (Array.isArray(turnItem[3]) && Array.isArray(turnItem[3][0])) {
+                  const candNode = turnItem[3][0][0];
+                  if (Array.isArray(candNode)) {
+                    asstChoiceId = candNode[0];
+                    const rawContent = candNode[1]?.[0] || '';
+                    if (typeof rawContent === 'string') {
+                      const extracted = extractThinkingAndText(rawContent);
+                      asstText = extracted.text;
+                      asstReasoning = extracted.thinking;
+                    }
+                  }
+                }
+
+                let timestamp: number | undefined;
+                if (Array.isArray(turnItem[4]) && typeof turnItem[4][0] === 'number') {
+                  timestamp = turnItem[4][0];
+                }
+
+                if (asstText || asstReasoning) {
+                  turns.push({
+                    role: 'assistant',
+                    content: asstText,
+                    reasoning_content: asstReasoning || undefined,
+                    choice_id: asstChoiceId,
+                    response_id: asstRespId,
+                    timestamp,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return { turns, lastRid, lastRcid };
+}
+

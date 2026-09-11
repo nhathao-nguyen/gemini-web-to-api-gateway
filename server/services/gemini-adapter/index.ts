@@ -27,6 +27,41 @@ export class GeminiProviderRouter implements AIProvider {
   ): AsyncIterable<AIStreamChunk> {
     return this.webProvider.ChatCompletionStream(account, request, signal);
   }
+
+  public async uploadFile(
+
+    account: GeminiAccount,
+    filename: string,
+    mimeType: string,
+    data: Buffer
+  ) {
+    return this.webProvider.uploadFile(account, filename, mimeType, data);
+  }
+
+  public async downloadGeneratedImage(
+    account: GeminiAccount,
+    rawUrl: string,
+    targetSize?: number
+  ) {
+    return this.webProvider.downloadGeneratedImage(account, rawUrl, targetSize);
+  }
+
+  public getModelCapabilities(modelId: string) {
+    return this.webProvider.getModelCapabilities(modelId);
+  }
+
+  public async getAccountQuota(account: GeminiAccount) {
+    return this.webProvider.fetchAccountQuota(account);
+  }
+
+  public async fetchRecentConversations(account: GeminiAccount, limit = 10) {
+    return this.webProvider.fetchRecentConversations(account, limit);
+  }
+
+  public async fetchConversationHistory(account: GeminiAccount, conversationId: string) {
+    return this.webProvider.fetchConversationHistory(account, conversationId);
+  }
 }
 
 export const geminiProvider = new GeminiProviderRouter();
+

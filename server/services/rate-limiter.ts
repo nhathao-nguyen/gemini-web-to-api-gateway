@@ -112,8 +112,8 @@ export class RateLimiter {
       this.initRedis(config.redisUrl);
     } else {
       if (config.isProduction) {
-        console.warn(
-          '[RateLimiter] Notice: REDIS_URL is not set in production. Using in-process MemoryRateLimiter adapter.'
+        throw new Error(
+          'FATAL: REDIS_URL environment variable is required in production! In-process memory fallback is prohibited.'
         );
       } else {
         console.log(
@@ -153,16 +153,128 @@ export class RateLimiter {
     }
   }
 
-  public checkAndAcquire(apiKey: ApiKey): { allowed: boolean; reason?: string; retryAfter?: number } {
-    // In-process memory limiter handles sub-millisecond precision and immediate synchronization
+  private async checkAndAcquireRedis(
+    apiKey: ApiKey
+  ): Promise<{ allowed: boolean; reason?: string; retryAfter?: number }> {
+    if (!this.redisClient || !this.isRedisConnected) {
+      if (config.isProduction) {
+        return { allowed: false, reason: 'Redis rate limiting service is unavailable' };
+      }
+      return this.memoryLimiter.checkAndAcquire(apiKey);
+    }
+
+    const now = Date.now();
+    const today = new Date().toISOString().slice(0, 10);
+    const concurKey = `gw:rl:concur:${apiKey.id}`;
+    const rpmKey = `gw:rl:rpm:${apiKey.id}`;
+    const dailyKey = `gw:rl:daily:${apiKey.id}:${today}`;
+
+    // 1. Check concurrent limits
+    if (apiKey.concurrent_limit > 0) {
+      const activeConcur = parseInt((await this.redisClient.get(concurKey)) || '0', 10);
+      if (activeConcur >= apiKey.concurrent_limit) {
+        return {
+          allowed: false,
+          reason: `Concurrent request limit reached (${apiKey.concurrent_limit} simultaneous requests)`,
+          retryAfter: 1,
+        };
+      }
+    }
+
+    // 2. Check RPM via sliding 60-second window in Redis ZSET
+    const oneMinuteAgo = now - 60000;
+    await this.redisClient.zremrangebyscore(rpmKey, 0, oneMinuteAgo);
+    const currentCount = await this.redisClient.zcard(rpmKey);
+
+    if (apiKey.rpm_limit > 0 && currentCount >= apiKey.rpm_limit) {
+      const oldestEntries = (await (this.redisClient as any).zrange(rpmKey, 0, 0)) as string[];
+      let waitSeconds = 1;
+      if (oldestEntries && oldestEntries.length > 0) {
+        const oldestTimestamp = parseInt(oldestEntries[0].split('-')[0], 10);
+        if (!isNaN(oldestTimestamp)) {
+          waitSeconds = Math.max(1, Math.ceil((oldestTimestamp + 60000 - now) / 1000));
+        }
+      }
+      return {
+        allowed: false,
+        reason: `Rate limit exceeded: ${apiKey.rpm_limit} requests per minute limit reached`,
+        retryAfter: waitSeconds,
+      };
+    }
+
+    // 3. Check Daily request limit
+    if (apiKey.daily_request_limit > 0) {
+      const dayCount = parseInt((await this.redisClient.get(dailyKey)) || '0', 10);
+      if (dayCount >= apiKey.daily_request_limit) {
+        return {
+          allowed: false,
+          reason: `Daily quota limit exceeded: ${apiKey.daily_request_limit} requests per day limit reached`,
+          retryAfter: 3600,
+        };
+      }
+    }
+
+    // Acquire lock in Redis
+    const pipeline = this.redisClient.pipeline();
+    pipeline.incr(concurKey);
+    pipeline.expire(concurKey, 300); // 5 min safety TTL in case worker dies
+    pipeline.zadd(rpmKey, now, `${now}-${Math.random()}`);
+    pipeline.expire(rpmKey, 120);
+    pipeline.incr(dailyKey);
+    pipeline.expire(dailyKey, 172800); // 2 days
+    await pipeline.exec();
+
+    return { allowed: true };
+  }
+
+  private async releaseRedis(apiKeyId: string): Promise<void> {
+    if (!this.redisClient || !this.isRedisConnected) {
+      this.memoryLimiter.release(apiKeyId);
+      return;
+    }
+    const concurKey = `gw:rl:concur:${apiKeyId}`;
+    const val = await this.redisClient.decr(concurKey);
+    if (val < 0) {
+      await this.redisClient.set(concurKey, '0');
+    }
+  }
+
+  public async checkAndAcquire(
+    apiKey: ApiKey
+  ): Promise<{ allowed: boolean; reason?: string; retryAfter?: number }> {
+    if (this.adapterType === 'RedisRateLimiter' && this.redisClient && this.isRedisConnected) {
+      return this.checkAndAcquireRedis(apiKey);
+    }
     return this.memoryLimiter.checkAndAcquire(apiKey);
   }
 
-  public release(apiKeyId: string) {
-    this.memoryLimiter.release(apiKeyId);
+  public async release(apiKeyId: string): Promise<void> {
+    if (this.adapterType === 'RedisRateLimiter' && this.redisClient && this.isRedisConnected) {
+      await this.releaseRedis(apiKeyId);
+    } else {
+      this.memoryLimiter.release(apiKeyId);
+    }
   }
 
-  public getStatus(apiKeyId: string) {
+  public async getStatus(apiKeyId: string): Promise<{
+    currentRpm: number;
+    currentConcurrent: number;
+    dailyUsed: number;
+  }> {
+    if (this.adapterType === 'RedisRateLimiter' && this.redisClient && this.isRedisConnected) {
+      const now = Date.now();
+      const today = new Date().toISOString().slice(0, 10);
+      const oneMinuteAgo = now - 60000;
+      await this.redisClient.zremrangebyscore(`gw:rl:rpm:${apiKeyId}`, 0, oneMinuteAgo);
+      const currentRpm = await this.redisClient.zcard(`gw:rl:rpm:${apiKeyId}`);
+      const currentConcurrent = parseInt((await this.redisClient.get(`gw:rl:concur:${apiKeyId}`)) || '0', 10);
+      const dailyUsed = parseInt((await this.redisClient.get(`gw:rl:daily:${apiKeyId}:${today}`)) || '0', 10);
+      return {
+        currentRpm,
+        currentConcurrent: Math.max(0, currentConcurrent),
+        dailyUsed,
+      };
+    }
     return this.memoryLimiter.getStatus(apiKeyId);
   }
 

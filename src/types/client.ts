@@ -6,6 +6,8 @@ export type AccountStatus =
   | 'DISABLED'
   | 'ERROR';
 
+export type KeepAliveStatus = 'IDLE' | 'REFRESHING' | 'SUCCESS' | 'FAILED';
+
 export interface SafeAccount {
   id: string;
   name: string;
@@ -15,6 +17,13 @@ export interface SafeAccount {
   priority: number;
   weight: number;
   supported_models: string[];
+  proxy_url?: string | null;
+  profile_dir?: string | null;
+  user_agent?: string | null;
+  locale?: string | null;
+  timezone?: string | null;
+  last_keepalive_at?: string | null;
+  keepalive_status?: KeepAliveStatus | null;
   last_success_at: string | null;
   last_error_at: string | null;
   last_error: string | null;
@@ -23,6 +32,17 @@ export interface SafeAccount {
   request_count: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface AccountQuotaInfo {
+  tier: string;
+  current_usage_percent: number;
+  current_reset_at: string;
+  current_reset_label: string;
+  weekly_usage_percent: number;
+  weekly_reset_at: string;
+  weekly_reset_label: string;
+  fetched_at: string;
 }
 
 export interface ApiKeyItem {
@@ -70,3 +90,21 @@ export interface AccountEventItem {
   reason: string;
   created_at: string;
 }
+
+export interface SystemSettings {
+  port: number;
+  host: string;
+  requestTimeout: number;
+  maxUpstreamAttempts: number;
+  logLevel: string;
+  corsOrigins: string[];
+  isProduction: boolean;
+  databaseEngine: string;
+  isDatabaseConnected: boolean;
+  hasRedis: boolean;
+  requiresAuth: boolean;
+  uptimeSeconds: number;
+  nodeVersion: string;
+  platform: string;
+}
+

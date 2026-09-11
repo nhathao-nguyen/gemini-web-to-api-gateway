@@ -4,10 +4,21 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import os from 'os';
+import { setGlobalDispatcher, Agent } from 'undici';
 import { config } from './server/config.js';
+import { db } from './server/db/database.js';
 import { openaiRouter } from './server/routes/openai-routes.js';
 import { adminRouter } from './server/routes/admin-routes.js';
 import { observabilityRouter } from './server/routes/observability-routes.js';
+import { keepAliveWorker } from './server/services/browser-manager/keepalive-worker.js';
+
+// Configure Undici global dispatcher with generous header buffer for Gemini Web large cookie payloads
+setGlobalDispatcher(
+  new Agent({
+    maxHeaderSize: 262144, // 256 KB
+    headersTimeout: 60000,
+  })
+);
 
 function getLanIpv4(): string | null {
   const interfaces = os.networkInterfaces();
@@ -33,6 +44,12 @@ function getLanIpv4(): string | null {
 }
 
 async function startServer() {
+  // Ensure database initialization is complete before accepting traffic
+  await db.init();
+
+  // Start Headless Browser Session Pool & Keep-Alive Worker
+  keepAliveWorker.start();
+
   const app = express();
   const PORT = config.port || 3000;
   const HOST = config.host || '0.0.0.0';
@@ -98,6 +115,16 @@ async function startServer() {
   app.use('/admin', cors(adminCorsOptions), adminRouter);
   app.use('/api/admin', cors(adminCorsOptions), adminRouter);
 
+  // Catch-all 404 handler for API routes (ensures API routes NEVER return HTML SPA fallback)
+  app.use(['/api', '/admin', '/v1', '/observability'], (req, res) => {
+    res.status(404).json({
+      error: {
+        message: `API endpoint ${req.method} ${req.originalUrl} not found`,
+        code: 'endpoint_not_found',
+      },
+    });
+  });
+
   // Vite middleware for frontend development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -109,6 +136,18 @@ async function startServer() {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
+      // Safeguard: Do NOT catch API or observability endpoints
+      if (
+        req.path.startsWith('/api') ||
+        req.path.startsWith('/admin') ||
+        req.path.startsWith('/v1') ||
+        req.path.startsWith('/observability') ||
+        req.path === '/health' ||
+        req.path === '/ready' ||
+        req.path === '/metrics'
+      ) {
+        return res.status(404).json({ error: 'Endpoint not found' });
+      }
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

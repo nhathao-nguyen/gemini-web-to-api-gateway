@@ -96,20 +96,20 @@ async function runAllTests() {
     last_used_at: null,
   };
 
-  assert(limiter.checkAndAcquire(testApiKey).allowed, '1st request permitted');
-  assert(limiter.checkAndAcquire(testApiKey).allowed, '2nd request permitted');
+  assert((await limiter.checkAndAcquire(testApiKey)).allowed, '1st request permitted');
+  assert((await limiter.checkAndAcquire(testApiKey)).allowed, '2nd request permitted');
   // Concurrency limit is 2
-  const concurExceeded = limiter.checkAndAcquire(testApiKey);
+  const concurExceeded = await limiter.checkAndAcquire(testApiKey);
   assert(!concurExceeded.allowed && concurExceeded.reason?.includes('Concurrent'), 'Concurrent request rejected at cap');
 
-  limiter.release(testApiKey.id);
-  assert(limiter.checkAndAcquire(testApiKey).allowed, '3rd request permitted after concurrency release');
+  await limiter.release(testApiKey.id);
+  assert((await limiter.checkAndAcquire(testApiKey)).allowed, '3rd request permitted after concurrency release');
 
   // Release concurrency so concurrent check doesn't shadow RPM check
-  limiter.release(testApiKey.id);
+  await limiter.release(testApiKey.id);
 
   // 4th request in same minute exceeds RPM limit (3)
-  const rpmExceeded = limiter.checkAndAcquire(testApiKey);
+  const rpmExceeded = await limiter.checkAndAcquire(testApiKey);
   assert(!rpmExceeded.allowed && rpmExceeded.reason?.includes('Rate limit'), 'RPM limit enforced correctly on 4th request');
 
   // 4. Account Scheduler Scoring

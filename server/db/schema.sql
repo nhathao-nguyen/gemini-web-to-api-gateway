@@ -11,6 +11,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     priority INT NOT NULL DEFAULT 10,
     weight INT NOT NULL DEFAULT 1,
     supported_models JSONB NOT NULL DEFAULT '[]',
+    proxy_url TEXT,
+    profile_dir TEXT,
+    user_agent TEXT,
+    locale VARCHAR(32) DEFAULT 'en-US',
+    timezone VARCHAR(64) DEFAULT 'America/New_York',
+    last_keepalive_at TIMESTAMPTZ,
+    keepalive_status VARCHAR(32) NOT NULL DEFAULT 'IDLE',
     last_success_at TIMESTAMPTZ,
     last_error_at TIMESTAMPTZ,
     last_error TEXT,
@@ -23,6 +30,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 CREATE INDEX IF NOT EXISTS idx_accounts_cooldown ON accounts(cooldown_until);
+CREATE INDEX IF NOT EXISTS idx_accounts_keepalive ON accounts(keepalive_status);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id VARCHAR(64) PRIMARY KEY,
@@ -74,3 +82,45 @@ CREATE TABLE IF NOT EXISTS settings (
     value JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id VARCHAR(64) PRIMARY KEY,
+    title VARCHAR(255) NOT NULL DEFAULT 'New Conversation',
+    model VARCHAR(64) NOT NULL,
+    account_id VARCHAR(64) NOT NULL,
+    upstream_cid VARCHAR(128),
+    upstream_rid VARCHAR(128),
+    upstream_rcid VARCHAR(128),
+    api_key_id VARCHAR(64),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_api_key ON conversations(api_key_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_account ON conversations(account_id);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id VARCHAR(64) PRIMARY KEY,
+    conversation_id VARCHAR(64) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(32) NOT NULL,
+    content TEXT NOT NULL,
+    reasoning_content TEXT,
+    attachments JSONB NOT NULL DEFAULT '[]',
+    generated_media JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+
+CREATE TABLE IF NOT EXISTS media_cache (
+    id VARCHAR(64) PRIMARY KEY,
+    account_id VARCHAR(64) NOT NULL,
+    upstream_url TEXT NOT NULL,
+    mime_type VARCHAR(64) NOT NULL DEFAULT 'image/png',
+    file_name VARCHAR(255) NOT NULL DEFAULT 'image.png',
+    data_b64 TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_cache_account ON media_cache(account_id);
+
