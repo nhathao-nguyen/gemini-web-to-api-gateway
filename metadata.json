@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Web-to-API Gateway",
+  "description": "Production-ready OpenAI-compatible gateway server powered by Gemini Web sessions with intelligent account pooling, scheduler, rate limiting, and admin console.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

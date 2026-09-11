@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini Cookie Extractor</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo-box">
+        <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
+        </svg>
+        <span class="title">Gemini Extractor</span>
+      </div>
+      <span id="account-slot-badge" class="badge badge-slot">Slot: checking...</span>
+    </header>
+
+    <main class="content">
+      <div id="status-card" class="card">
+        <div class="card-row">
+          <span class="label">Trạng thái:</span>
+          <span id="session-status" class="status-pill status-loading">Đang quét...</span>
+        </div>
+        <div class="card-row">
+          <span class="label">__Secure-1PSID:</span>
+          <span id="psid-status" class="status-indicator">...</span>
+        </div>
+        <div class="card-row">
+          <span class="label">__Secure-1PSIDTS:</span>
+          <span id="psidts-status" class="status-indicator">...</span>
+        </div>
+        <div class="card-row">
+          <span class="label">Tổng Cookies:</span>
+          <span id="cookie-count" class="value">0</span>
+        </div>
+      </div>
+
+      <div class="preview-group">
+        <label class="section-label" for="cookie-preview">Cookie Header:</label>
+        <textarea id="cookie-preview" readonly placeholder="Đang trích xuất cookie từ gemini.google.com..."></textarea>
+      </div>
+
+      <div class="actions">
+        <button id="btn-copy" class="btn btn-primary" disabled>
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+          </svg>
+          <span id="copy-btn-text">Copy Cookie Header</span>
+        </button>
+
+        <button id="btn-open-gemini" class="btn btn-secondary">
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+          Mở Gemini Web
+        </button>
+      </div>
+
+      <div id="notice-msg" class="notice notice-info">
+        Đăng nhập vào <strong>gemini.google.com</strong> trước khi bấm trích xuất.
+      </div>
+    </main>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
