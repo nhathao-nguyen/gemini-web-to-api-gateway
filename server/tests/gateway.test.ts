@@ -341,6 +341,10 @@ async function runAllTests() {
   const { runProtocolTests } = await import('./gemini-protocol.test.js');
   await runProtocolTests();
 
+  // 11. Regression Test Suite
+  const { runRegressionTests } = await import('./regression.test.js');
+  await runRegressionTests();
+
   console.log(`\n========================================`);
   console.log(`🏁 Test Results: ${testsPassed} Passed, ${testsFailed} Failed`);
   console.log(`========================================\n`);

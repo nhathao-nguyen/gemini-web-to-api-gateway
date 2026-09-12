@@ -71,6 +71,16 @@ export interface AccountEvent {
   created_at: string;
 }
 
+export interface UploadedFileRecord {
+  id: string;
+  account_id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  created_at: string;
+  expires_at: string;
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;

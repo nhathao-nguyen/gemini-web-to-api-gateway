@@ -48,6 +48,52 @@ export function getDispatcherForProxy(proxyUrl?: string | null): Dispatcher | un
   }
   return agent;
 }
+
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = config.requestTimeout || 60000,
+  externalSignal?: AbortSignal
+): Promise<Response> {
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => {
+    timeoutController.abort(new Error(`UPSTREAM_TIMEOUT: Upstream request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  let onExternalAbort: (() => void) | undefined;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      clearTimeout(timer);
+      throw externalSignal.reason || new Error('CLIENT_ABORT: Request aborted by client');
+    }
+    onExternalAbort = () => {
+      timeoutController.abort(externalSignal.reason || new Error('CLIENT_ABORT: Request aborted by client'));
+    };
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: timeoutController.signal,
+    });
+    return res;
+  } catch (err: any) {
+    if (externalSignal?.aborted) {
+      throw new Error(`CLIENT_ABORT: Request cancelled by client`);
+    }
+    if (timeoutController.signal.aborted) {
+      throw new Error(`UPSTREAM_TIMEOUT: Upstream request timed out after ${timeoutMs}ms (${err.message})`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal && onExternalAbort) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+    }
+  }
+}
+
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -838,6 +884,14 @@ export function parseGoogleWireResponse(rawBody: string): {
 export class GeminiWebProvider implements AIProvider {
   private sessionCache = new Map<string, GeminiWebSession>();
 
+  public invalidateSession(accountId: string): boolean {
+    const deleted = this.sessionCache.delete(accountId);
+    if (deleted) {
+      console.log(`[GeminiWeb] Invalidated cached session for account ${accountId}`);
+    }
+    return deleted;
+  }
+
   private getFormattedCookie(account: GeminiAccount): string {
     const raw = decryptCookie(account.encrypted_cookie, config.masterEncryptionKey);
     let cookieHeader = cleanCookie(raw);
@@ -867,7 +921,7 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    let res = await fetch(targetUrl, {
+    let res = await fetchWithTimeout(targetUrl, {
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
         'Cookie': cookie,
@@ -900,7 +954,7 @@ export class GeminiWebProvider implements AIProvider {
         account.auth_user = slotMatch[1];
         console.log(`[Upstream Gemini Web Handshake] Following account slot redirect to /u/${account.auth_user}/...`);
         const redirectUrl = location.includes('?hl=') ? location : `${location}?hl=en`;
-        res = await fetch(redirectUrl, {
+        res = await fetchWithTimeout(redirectUrl, {
           headers: {
             'User-Agent': BROWSER_USER_AGENT,
             'Cookie': cookie,
@@ -1021,7 +1075,7 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(targetUrl, {
+    const res = await fetchWithTimeout(targetUrl, {
       method: 'POST',
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
@@ -1096,7 +1150,7 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(targetUrl, {
+    const res = await fetchWithTimeout(targetUrl, {
       method: 'POST',
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
@@ -1155,17 +1209,43 @@ export class GeminiWebProvider implements AIProvider {
     return { name: filename, mimeType, data: buffer };
   }
 
-  public buildPromptAndAttachments(messages: ChatCompletionRequest['messages']): {
+  public buildPromptAndAttachments(
+    messages: ChatCompletionRequest['messages'],
+    hasNativeConversation = false
+  ): {
     prompt: string;
     systemPrompt?: string;
     attachments: Array<{ name: string; mimeType: string; data: Buffer }>;
   } {
     let systemPrompt = '';
-    const promptParts: string[] = [];
     const attachments: Array<{ name: string; mimeType: string; data: Buffer }> = [];
 
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
+    // Extract system instructions across messages
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        systemPrompt += (systemPrompt ? '\n' : '') + text;
+      }
+    }
+
+    // Determine target messages:
+    // If native conversation exists (valid upstream cid/rid/rcid), ONLY send the latest user turn.
+    // Otherwise, replay full conversation history to establish context.
+    let targetMessages = messages;
+    if (hasNativeConversation) {
+      const lastUserIndex = messages.map((m) => m.role).lastIndexOf('user');
+      if (lastUserIndex !== -1) {
+        targetMessages = [messages[lastUserIndex]];
+      } else {
+        const nonSystem = messages.filter((m) => m.role !== 'system');
+        targetMessages = nonSystem.slice(-1);
+      }
+    }
+
+    const promptParts: string[] = [];
+
+    for (let i = 0; i < targetMessages.length; i++) {
+      const msg = targetMessages[i];
       let textContent = '';
 
       if (typeof msg.content === 'string') {
@@ -1196,9 +1276,13 @@ export class GeminiWebProvider implements AIProvider {
       }
 
       if (msg.role === 'system') {
-        systemPrompt += (systemPrompt ? '\n' : '') + textContent;
+        continue;
       } else if (msg.role === 'user') {
-        promptParts.push(`User: ${textContent}`);
+        if (hasNativeConversation) {
+          promptParts.push(textContent);
+        } else {
+          promptParts.push(`User: ${textContent}`);
+        }
       } else if (msg.role === 'assistant') {
         promptParts.push(`Assistant: ${textContent}`);
       }
@@ -1240,14 +1324,14 @@ export class GeminiWebProvider implements AIProvider {
     const uploadStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
     // 1. OPTIONS request
-    await fetch('https://content-push.googleapis.com/upload', {
+    await fetchWithTimeout('https://content-push.googleapis.com/upload', {
       method: 'OPTIONS',
       headers: startHeaders,
       dispatcher,
     } as any).catch(() => {});
 
     // 2. POST start
-    const startRes = await fetch('https://content-push.googleapis.com/upload', {
+    const startRes = await fetchWithTimeout('https://content-push.googleapis.com/upload', {
       method: 'POST',
       headers: startHeaders,
       body: 'File name: ' + sanitizedFilename,
@@ -1264,14 +1348,14 @@ export class GeminiWebProvider implements AIProvider {
     }
 
     // 3. OPTIONS to uploadUrl
-    await fetch(uploadUrl, {
+    await fetchWithTimeout(uploadUrl, {
       method: 'OPTIONS',
       headers: startHeaders,
       dispatcher,
     } as any).catch(() => {});
 
     // 4. POST file bytes & finalize
-    const uploadRes = await fetch(uploadUrl, {
+    const uploadRes = await fetchWithTimeout(uploadUrl, {
       method: 'POST',
       headers: {
         'Accept': '*/*',
@@ -1317,7 +1401,7 @@ export class GeminiWebProvider implements AIProvider {
     }
 
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    let res = await fetch(imageUrl, {
+    let res = await fetchWithTimeout(imageUrl, {
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
         'Referer': 'https://gemini.google.com/',
@@ -1328,7 +1412,7 @@ export class GeminiWebProvider implements AIProvider {
 
     if (!res.ok && (res.status === 403 || res.status === 401)) {
       // Retry without Cookie header as Google User Content CDN often rejects session cookies
-      res = await fetch(imageUrl, {
+      res = await fetchWithTimeout(imageUrl, {
         headers: {
           'User-Agent': BROWSER_USER_AGENT,
           'Referer': 'https://gemini.google.com/',
@@ -1370,7 +1454,18 @@ export class GeminiWebProvider implements AIProvider {
     const session = await this.getOrFetchSession(account);
     const resolvedModel = resolveGeminiModel(request.model, session.discoveredModels);
 
-    const { prompt, attachments } = this.buildPromptAndAttachments(request.messages);
+    // Pass native Gemini conversation state if available (only real upstream c_ IDs, never local conv_ IDs or arbitrary test inputs like '123')
+    const rawCid = (request.upstream_cid || request.conversation_id || '').trim();
+    const nativeCid = rawCid.startsWith('c_') ? rawCid : undefined;
+    const hasNativeConversation = Boolean(nativeCid);
+
+    let { prompt, attachments } = this.buildPromptAndAttachments(request.messages, hasNativeConversation);
+
+    // Support OpenAI response_format json_object if requested
+    if (request.response_format?.type === 'json_object') {
+      prompt += '\n\nIMPORTANT: Respond ONLY with valid JSON. Do not include markdown formatting or explanations.';
+    }
+
     const uploadedFiles: UploadedFileRef[] = request.uploaded_files ? [...request.uploaded_files] : [];
 
     // Upload inline attachments upstream
@@ -1381,10 +1476,6 @@ export class GeminiWebProvider implements AIProvider {
 
     const requestId = crypto.randomUUID().toUpperCase();
     const isTemporary = false;
-
-    // Pass native Gemini conversation state if available (only real upstream c_ IDs, never local conv_ IDs or arbitrary test inputs like '123')
-    const rawCid = (request.upstream_cid || request.conversation_id || '').trim();
-    const nativeCid = rawCid.startsWith('c_') ? rawCid : undefined;
 
     const metadata = {
       cid: nativeCid,
@@ -1446,13 +1537,17 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(rpcUrl, {
-      method: 'POST',
-      headers,
-      body: bodyParams.toString(),
-      signal,
-      dispatcher,
-    } as any);
+    const res = await fetchWithTimeout(
+      rpcUrl,
+      {
+        method: 'POST',
+        headers,
+        body: bodyParams.toString(),
+        dispatcher,
+      } as any,
+      config.requestTimeout || 60000,
+      signal
+    );
 
     console.log(`[Upstream Gemini Web RPC] request_id=${requestId} account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -1479,12 +1574,33 @@ export class GeminiWebProvider implements AIProvider {
     const textBody = await res.text();
     const parsed = parseGoogleWireResponse(textBody);
 
+    let text = parsed.text;
+
+    // Apply stop sequences
+    if (request.stop) {
+      const stopList = (Array.isArray(request.stop) ? request.stop : [request.stop]).filter(Boolean);
+      for (const stopSeq of stopList) {
+        const idx = text.indexOf(stopSeq);
+        if (idx !== -1) {
+          text = text.slice(0, idx);
+        }
+      }
+    }
+
+    // Apply max_tokens
+    if (request.max_tokens && request.max_tokens > 0) {
+      const maxChars = request.max_tokens * 4;
+      if (text.length > maxChars) {
+        text = text.slice(0, maxChars);
+      }
+    }
+
     const promptText = request.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join(' ');
     const promptTokens = Math.max(1, Math.round(promptText.length / 4));
-    const completionTokens = Math.max(1, Math.round(parsed.text.length / 4));
+    const completionTokens = Math.max(1, Math.round(text.length / 4));
 
     return {
-      text: parsed.text,
+      text,
       reasoning_content: parsed.thinking,
       conversation_id: parsed.conversation_id,
       response_id: parsed.response_id,
@@ -1520,10 +1636,16 @@ export class GeminiWebProvider implements AIProvider {
     let upstreamFirstChunkTs: number | null = null;
     let downstreamFirstChunkTs: number | null = null;
 
+    let hitStop = false;
+    let stopList: string[] = [];
+    if (request.stop) {
+      stopList = (Array.isArray(request.stop) ? request.stop : [request.stop]).filter(Boolean);
+    }
+
     try {
       while (true) {
-        if (signal?.aborted) {
-          await reader.cancel();
+        if (signal?.aborted || hitStop) {
+          await reader.cancel().catch(() => {});
           break;
         }
 
@@ -1540,6 +1662,7 @@ export class GeminiWebProvider implements AIProvider {
           lineBuffer = lines.pop() || ''; // Keep incomplete trailing fragment
 
           for (const line of lines) {
+            if (hitStop) break;
             const trimmed = line.trim();
             if (!trimmed || /^\d+$/.test(trimmed)) continue;
 
@@ -1547,6 +1670,7 @@ export class GeminiWebProvider implements AIProvider {
               const root = JSON.parse(trimmed.replace(/^\)]\}'\s*/, ''));
               if (Array.isArray(root)) {
                 for (const item of root) {
+                  if (hitStop) break;
                   if (!Array.isArray(item) || item.length < 1) continue;
 
                   const errStr = extractBardError(item);
@@ -1614,22 +1738,54 @@ export class GeminiWebProvider implements AIProvider {
                             }
 
                             // Yield text delta if any
-                            if (text && text.length > emittedText.length) {
-                              const delta = text.slice(emittedText.length);
-                              emittedText = text;
+                            if (text && text.length > emittedText.length && !hitStop) {
+                              let delta = text.slice(emittedText.length);
+                              let newTotal = emittedText + delta;
 
-                              if (downstreamFirstChunkTs === null) {
-                                downstreamFirstChunkTs = performance.now();
-                                console.log(`[Stream Timing] Downstream first SSE write at ${(downstreamFirstChunkTs - streamStart).toFixed(2)}ms`);
+                              // Check stop sequences
+                              for (const stopSeq of stopList) {
+                                const stopIdx = newTotal.indexOf(stopSeq);
+                                if (stopIdx !== -1) {
+                                  hitStop = true;
+                                  const allowedLen = Math.max(0, stopIdx - emittedText.length);
+                                  delta = delta.slice(0, allowedLen);
+                                  newTotal = emittedText + delta;
+                                  break;
+                                }
                               }
 
-                              yield {
-                                text_delta: delta,
-                                is_done: false,
-                                conversation_id: convId,
-                                response_id: respId,
-                                choice_id: choiceId,
-                              };
+                              // Check max_tokens
+                              if (request.max_tokens && request.max_tokens > 0) {
+                                const maxChars = request.max_tokens * 4;
+                                if (newTotal.length >= maxChars) {
+                                  hitStop = true;
+                                  const allowedLen = Math.max(0, maxChars - emittedText.length);
+                                  delta = delta.slice(0, allowedLen);
+                                  newTotal = emittedText + delta;
+                                }
+                              }
+
+                              emittedText = newTotal;
+
+                              if (delta) {
+                                if (downstreamFirstChunkTs === null) {
+                                  downstreamFirstChunkTs = performance.now();
+                                  console.log(`[Stream Timing] Downstream first SSE write at ${(downstreamFirstChunkTs - streamStart).toFixed(2)}ms`);
+                                }
+
+                                yield {
+                                  text_delta: delta,
+                                  is_done: false,
+                                  conversation_id: convId,
+                                  response_id: respId,
+                                  choice_id: choiceId,
+                                };
+                              }
+
+                              if (hitStop) {
+                                await reader.cancel().catch(() => {});
+                                break;
+                              }
                             }
                           }
                         }
@@ -1645,7 +1801,7 @@ export class GeminiWebProvider implements AIProvider {
           }
         }
 
-        if (done) {
+        if (done || hitStop) {
           const upstreamCompletionTs = performance.now();
           console.log(`[Stream Timing] Upstream stream completed at ${(upstreamCompletionTs - streamStart).toFixed(2)}ms`);
           if (downstreamFirstChunkTs !== null) {
@@ -1696,7 +1852,7 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(targetUrl, {
+    const res = await fetchWithTimeout(targetUrl, {
       method: 'POST',
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
@@ -1754,7 +1910,7 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(targetUrl, {
+    const res = await fetchWithTimeout(targetUrl, {
       method: 'POST',
       headers: {
         'User-Agent': BROWSER_USER_AGENT,

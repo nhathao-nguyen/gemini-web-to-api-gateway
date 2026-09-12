@@ -174,7 +174,17 @@ for chunk in response:
               </div>
               <div className="flex justify-between py-1 border-b border-zinc-50">
                 <span className="text-zinc-500">Database Status:</span>
-                <span className="text-emerald-700 font-medium">Connected & Healthy</span>
+                {settings.isDatabaseConnected ? (
+                  <span className="text-emerald-700 font-medium inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                    Connected & Healthy
+                  </span>
+                ) : (
+                  <span className="text-rose-700 font-medium inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+                    Disconnected
+                  </span>
+                )}
               </div>
               <div className="flex justify-between py-1 border-b border-zinc-50">
                 <span className="text-zinc-500">Redis Distributed Store:</span>

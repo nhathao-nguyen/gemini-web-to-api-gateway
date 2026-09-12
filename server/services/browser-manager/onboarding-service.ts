@@ -12,6 +12,7 @@ import { encryptCookie } from '../../utils/crypto.js';
 import { normalizeCookieString, validateGeminiCookie } from '../../utils/cookie.js';
 import { config } from '../../config.js';
 import { GeminiAccount } from '../../types.js';
+import { geminiProvider } from '../gemini-adapter/index.js';
 
 export type OnboardingStep =
   | 'INITIALIZING'
@@ -350,6 +351,8 @@ class BrowserOnboardingService {
               created_at: nowStr,
             });
           }
+
+          geminiProvider.invalidateSession(session.accountId);
 
           const { encrypted_cookie, ...safeAccount } = savedAccount;
           session.account = safeAccount;

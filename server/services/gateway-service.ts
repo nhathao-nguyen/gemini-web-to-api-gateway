@@ -110,12 +110,35 @@ export class GatewayService {
   ): Promise<{ response: ChatCompletionResponse; accountUsed: GeminiAccount }> {
     const startTime = Date.now();
 
+    // 0. Parameter validation: tools / tool_choice
+    if (request.tools && request.tools.length > 0) {
+      throw new Error('INVALID_REQUEST: Tools and function calling are not supported by the Gemini Web adapter');
+    }
+    if (request.tool_choice) {
+      throw new Error('INVALID_REQUEST: Tool choice is not supported by the Gemini Web adapter');
+    }
+
     // 1. Model permission check
     if (!apiKeyManager.isModelAllowed(apiKey, request.model)) {
       throw new Error(`MODEL_NOT_ALLOWED: Your API key is not permitted to access model "${request.model}"`);
     }
 
-    // 2. Attach existing conversation state from DB if requested
+    // 2. Check file upload account affinity
+    let fileAffinityAccountId: string | null = null;
+    if (request.uploaded_files && request.uploaded_files.length > 0) {
+      for (const fileRef of request.uploaded_files) {
+        const fileRecord = db.getUploadedFile(fileRef.id);
+        if (fileRecord) {
+          if (!fileAffinityAccountId) {
+            fileAffinityAccountId = fileRecord.account_id;
+          } else if (fileAffinityAccountId !== fileRecord.account_id) {
+            throw new Error('FILE_ACCOUNT_MISMATCH: Uploaded files belong to multiple different Gemini accounts and cannot be combined in a single request');
+          }
+        }
+      }
+    }
+
+    // 3. Attach existing conversation state from DB if requested
     let localConv = request.conversation_id ? db.getConversation(request.conversation_id) : undefined;
     if (localConv) {
       if (localConv.api_key_id && localConv.api_key_id !== apiKey.id) {
@@ -124,26 +147,16 @@ export class GatewayService {
       request.upstream_cid = localConv.upstream_cid || request.upstream_cid;
       request.upstream_rid = localConv.upstream_rid || request.upstream_rid;
       request.upstream_rcid = localConv.upstream_rcid || request.upstream_rcid;
-
-      // Log user message to conversation history
-      const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user');
-      const userText = lastUserMsg
-        ? typeof lastUserMsg.content === 'string'
-          ? lastUserMsg.content
-          : JSON.stringify(lastUserMsg.content)
-        : '';
-      if (userText) {
-        db.createMessage({
-          id: `msg_${crypto.randomBytes(8).toString('hex')}`,
-          conversation_id: localConv.id,
-          role: 'user',
-          content: userText,
-          created_at: new Date().toISOString(),
-        });
-      }
     } else if (request.conversation_id?.startsWith('c_') && !request.upstream_cid) {
       request.upstream_cid = request.conversation_id;
     }
+
+    const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user');
+    const userText = lastUserMsg
+      ? typeof lastUserMsg.content === 'string'
+        ? lastUserMsg.content
+        : JSON.stringify(lastUserMsg.content)
+      : '';
 
     const excludedIds: string[] = [];
     const maxAttempts = config.maxUpstreamAttempts || 2;
@@ -152,8 +165,15 @@ export class GatewayService {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let targetAccount: GeminiAccount | null = null;
 
-      // Check sticky session on first attempt
-      if (attempt === 1 && (localConv?.account_id || request.conversation_id)) {
+      // File upload account affinity takes absolute precedence
+      if (fileAffinityAccountId) {
+        const acc = db.getAccountById(fileAffinityAccountId);
+        if (!acc || acc.status !== 'ACTIVE') {
+          throw new Error(`NO_HEALTHY_ACCOUNTS: The Gemini account (${fileAffinityAccountId}) that owns the uploaded file is inactive or unavailable`);
+        }
+        targetAccount = acc;
+      } else if (attempt === 1 && (localConv?.account_id || request.conversation_id)) {
+        // Check sticky session on first attempt
         const convKey = localConv?.id || request.conversation_id!;
         targetAccount = accountScheduler.getStickyAccount(convKey, request.model);
         if (!targetAccount && localConv?.account_id) {
@@ -207,29 +227,39 @@ export class GatewayService {
         }
 
         // Save sticky conversation if conversation_id was provided or generated
-      const convId = localConv?.id || request.conversation_id || result.conversation_id;
-      if (convId) {
-        accountScheduler.setStickySession(convId, targetAccount.id);
-      }
+        const convId = localConv?.id || request.conversation_id || result.conversation_id;
+        if (convId) {
+          accountScheduler.setStickySession(convId, targetAccount.id);
+        }
 
-        // Update persistent conversation record & store assistant message
+        // Update persistent conversation record & store user + assistant messages atomically in a transaction
         if (localConv) {
-          db.updateConversation(localConv.id, {
-            account_id: targetAccount.id,
-            upstream_cid: result.conversation_id || localConv.upstream_cid,
-            upstream_rid: result.response_id || localConv.upstream_rid,
-            upstream_rcid: result.choice_id || localConv.upstream_rcid,
+          db.transaction(() => {
+            if (userText) {
+              db.createMessage({
+                id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+                conversation_id: localConv!.id,
+                role: 'user',
+                content: userText,
+                created_at: new Date().toISOString(),
+              });
+            }
+            db.updateConversation(localConv!.id, {
+              account_id: targetAccount!.id,
+              upstream_cid: result.conversation_id || localConv!.upstream_cid,
+              upstream_rid: result.response_id || localConv!.upstream_rid,
+              upstream_rcid: result.choice_id || localConv!.upstream_rcid,
+            });
+            db.createMessage({
+              id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+              conversation_id: localConv!.id,
+              role: 'assistant',
+              content: result.text,
+              reasoning_content: result.reasoning_content,
+              generated_media: result.images,
+              created_at: new Date().toISOString(),
+            });
           });
-
-          db.createMessage({
-            id: `msg_${crypto.randomBytes(8).toString('hex')}`,
-            conversation_id: localConv.id,
-            role: 'assistant',
-            content: result.text,
-            reasoning_content: result.reasoning_content,
-          generated_media: result.images,
-          created_at: new Date().toISOString(),
-        });
         } else {
           this.persistNewConversation(request, apiKey, targetAccount, result);
         }
@@ -251,12 +281,34 @@ export class GatewayService {
         return { response: openAiResponse, accountUsed: targetAccount };
       } catch (err: any) {
         lastError = err;
+        const errMsg = err.message || String(err);
+
+        // 1. Client cancellation / abort: do NOT failover, do NOT penalize account
+        if (signal?.aborted || errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError')) {
+          throw err;
+        }
+
+        // 2. Request validation / authorization error: do NOT failover
+        if (
+          errMsg.includes('MODEL_NOT_ALLOWED') ||
+          errMsg.includes('INVALID_REQUEST') ||
+          errMsg.includes('FILE_ACCOUNT_MISMATCH')
+        ) {
+          throw err;
+        }
+
+        // 3. File upload bound to a specific account cannot failover to a different account
+        if (fileAffinityAccountId) {
+          quotaManager.recordError(targetAccount.id, err);
+          throw err;
+        }
+
         quotaManager.recordError(targetAccount.id, err);
         excludedIds.push(targetAccount.id);
 
         console.warn(
           `[Gateway] Attempt ${attempt}/${maxAttempts} failed on account "${targetAccount.name}": ${redactString(
-            err.message || String(err)
+            errMsg
           )}`
         );
       } finally {
@@ -288,9 +340,36 @@ export class GatewayService {
     requestId: string
   ): Promise<{ created: number; data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }> }> {
     const startTime = Date.now();
-    const modelToUse = request.model || accountScheduler.getAvailableModels()[0] || 'gemini-2.5-flash';
 
-    const targetAccount = accountScheduler.selectAccount(modelToUse) || accountScheduler.selectAnyActiveAccount();
+    let modelToUse: string;
+    if (request.model) {
+      if (!apiKeyManager.isModelAllowed(apiKey, request.model)) {
+        throw new Error(`MODEL_NOT_ALLOWED: Your API key is not permitted to access model "${request.model}"`);
+      }
+      modelToUse = request.model;
+    } else {
+      const availableModels = accountScheduler.getAvailableModels();
+      const permittedModels = availableModels.filter((m) => apiKeyManager.isModelAllowed(apiKey, m));
+      if (permittedModels.length === 0) {
+        throw new Error(`MODEL_NOT_ALLOWED: No available account models permitted for this API key`);
+      }
+      modelToUse = permittedModels[0];
+    }
+
+    let targetAccount = accountScheduler.selectAccount(modelToUse);
+    if (!targetAccount) {
+      // If primary selection had no healthy account, only fallback to models permitted for this API key
+      const availableModels = accountScheduler.getAvailableModels();
+      const permittedModels = availableModels.filter((m) => apiKeyManager.isModelAllowed(apiKey, m));
+      for (const fallbackModel of permittedModels) {
+        targetAccount = accountScheduler.selectAccount(fallbackModel);
+        if (targetAccount) {
+          modelToUse = fallbackModel;
+          break;
+        }
+      }
+    }
+
     if (!targetAccount) {
       throw new Error(`NO_HEALTHY_ACCOUNTS: No active Gemini account available for image generation`);
     }
@@ -392,10 +471,35 @@ export class GatewayService {
   ): AsyncIterable<string> {
     const startTime = Date.now();
 
+    // 0. Parameter validation: tools / tool_choice
+    if (request.tools && request.tools.length > 0) {
+      throw new Error('INVALID_REQUEST: Tools and function calling are not supported by the Gemini Web adapter');
+    }
+    if (request.tool_choice) {
+      throw new Error('INVALID_REQUEST: Tool choice is not supported by the Gemini Web adapter');
+    }
+
+    // 1. Model permission check
     if (!apiKeyManager.isModelAllowed(apiKey, request.model)) {
       throw new Error(`MODEL_NOT_ALLOWED: Your API key is not permitted to access model "${request.model}"`);
     }
 
+    // 2. Check file upload account affinity
+    let fileAffinityAccountId: string | null = null;
+    if (request.uploaded_files && request.uploaded_files.length > 0) {
+      for (const fileRef of request.uploaded_files) {
+        const fileRecord = db.getUploadedFile(fileRef.id);
+        if (fileRecord) {
+          if (!fileAffinityAccountId) {
+            fileAffinityAccountId = fileRecord.account_id;
+          } else if (fileAffinityAccountId !== fileRecord.account_id) {
+            throw new Error('FILE_ACCOUNT_MISMATCH: Uploaded files belong to multiple different Gemini accounts and cannot be combined in a single request');
+          }
+        }
+      }
+    }
+
+    // 3. Attach existing conversation state from DB if requested
     let localConv = request.conversation_id ? db.getConversation(request.conversation_id) : undefined;
     if (localConv) {
       if (localConv.api_key_id && localConv.api_key_id !== apiKey.id) {
@@ -404,26 +508,16 @@ export class GatewayService {
       request.upstream_cid = localConv.upstream_cid || request.upstream_cid;
       request.upstream_rid = localConv.upstream_rid || request.upstream_rid;
       request.upstream_rcid = localConv.upstream_rcid || request.upstream_rcid;
-
-      // Log user message to conversation history
-      const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user');
-      const userText = lastUserMsg
-        ? typeof lastUserMsg.content === 'string'
-          ? lastUserMsg.content
-          : JSON.stringify(lastUserMsg.content)
-        : '';
-      if (userText) {
-        db.createMessage({
-          id: `msg_${crypto.randomBytes(8).toString('hex')}`,
-          conversation_id: localConv.id,
-          role: 'user',
-          content: userText,
-          created_at: new Date().toISOString(),
-        });
-      }
     } else if (request.conversation_id?.startsWith('c_') && !request.upstream_cid) {
       request.upstream_cid = request.conversation_id;
     }
+
+    const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user');
+    const userText = lastUserMsg
+      ? typeof lastUserMsg.content === 'string'
+        ? lastUserMsg.content
+        : JSON.stringify(lastUserMsg.content)
+      : '';
 
     const excludedIds: string[] = [];
     const maxAttempts = config.maxUpstreamAttempts || 2;
@@ -435,7 +529,15 @@ export class GatewayService {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       targetAccount = null;
-      if (attempt === 1 && (localConv?.account_id || request.conversation_id)) {
+
+      // File upload account affinity takes absolute precedence
+      if (fileAffinityAccountId) {
+        const acc = db.getAccountById(fileAffinityAccountId);
+        if (!acc || acc.status !== 'ACTIVE') {
+          throw new Error(`NO_HEALTHY_ACCOUNTS: The Gemini account (${fileAffinityAccountId}) that owns the uploaded file is inactive or unavailable`);
+        }
+        targetAccount = acc;
+      } else if (attempt === 1 && (localConv?.account_id || request.conversation_id)) {
         const convKey = localConv?.id || request.conversation_id!;
         targetAccount = accountScheduler.getStickyAccount(convKey, request.model);
         if (!targetAccount && localConv?.account_id) {
@@ -443,6 +545,7 @@ export class GatewayService {
           targetAccount = accs.find((a) => a.id === localConv!.account_id && a.status === 'ACTIVE') || null;
         }
       }
+
       if (!targetAccount) {
         targetAccount = accountScheduler.selectAccount(request.model, excludedIds);
       }
@@ -463,12 +566,34 @@ export class GatewayService {
         break; // Successfully connected and obtained first stream frame
       } catch (connErr: any) {
         lastError = connErr;
+        const errMsg = connErr.message || String(connErr);
         accountScheduler.decrementActive(targetAccount.id);
+
+        // 1. Client cancellation / abort: do NOT failover, do NOT penalize account
+        if (signal?.aborted || errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError')) {
+          throw connErr;
+        }
+
+        // 2. Request validation / authorization error: do NOT failover
+        if (
+          errMsg.includes('MODEL_NOT_ALLOWED') ||
+          errMsg.includes('INVALID_REQUEST') ||
+          errMsg.includes('FILE_ACCOUNT_MISMATCH')
+        ) {
+          throw connErr;
+        }
+
+        // 3. File upload bound to a specific account cannot failover to a different account
+        if (fileAffinityAccountId) {
+          quotaManager.recordError(targetAccount.id, connErr);
+          throw connErr;
+        }
+
         quotaManager.recordError(targetAccount.id, connErr);
         excludedIds.push(targetAccount.id);
         console.warn(
           `[Gateway Stream] Attempt ${attempt}/${maxAttempts} failed on account "${targetAccount.name}": ${redactString(
-            connErr.message || String(connErr)
+            errMsg
           )}`
         );
         targetAccount = null;
@@ -570,21 +695,32 @@ export class GatewayService {
       }
 
       if (localConv) {
-        db.updateConversation(localConv.id, {
-          account_id: targetAccount.id,
-          upstream_cid: lastConvId || localConv.upstream_cid,
-          upstream_rid: lastRespId || localConv.upstream_rid,
-          upstream_rcid: lastChoiceId || localConv.upstream_rcid,
-        });
+        db.transaction(() => {
+          if (userText) {
+            db.createMessage({
+              id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+              conversation_id: localConv!.id,
+              role: 'user',
+              content: userText,
+              created_at: new Date().toISOString(),
+            });
+          }
+          db.updateConversation(localConv!.id, {
+            account_id: targetAccount!.id,
+            upstream_cid: lastConvId || localConv!.upstream_cid,
+            upstream_rid: lastRespId || localConv!.upstream_rid,
+            upstream_rcid: lastChoiceId || localConv!.upstream_rcid,
+          });
 
-        db.createMessage({
-          id: `msg_${crypto.randomBytes(8).toString('hex')}`,
-          conversation_id: localConv.id,
-          role: 'assistant',
-          content: fullText,
-          reasoning_content: fullReasoning || undefined,
-          generated_media: streamImages.length > 0 ? streamImages : undefined,
-          created_at: new Date().toISOString(),
+          db.createMessage({
+            id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+            conversation_id: localConv!.id,
+            role: 'assistant',
+            content: fullText,
+            reasoning_content: fullReasoning || undefined,
+            generated_media: streamImages.length > 0 ? streamImages : undefined,
+            created_at: new Date().toISOString(),
+          });
         });
       } else {
         this.persistNewConversation(request, apiKey, targetAccount, {
@@ -608,15 +744,18 @@ export class GatewayService {
         created_at: new Date().toISOString(),
       });
     } catch (err: any) {
-      quotaManager.recordError(targetAccount.id, err);
+      const errMsg = err.message || String(err);
+      if (!signal?.aborted && !errMsg.includes('CLIENT_ABORT') && !errMsg.includes('AbortError')) {
+        quotaManager.recordError(targetAccount.id, err);
+      }
       usageService.logRequest({
         request_id: requestId,
         api_key_id: apiKey.id,
         account_id: targetAccount.id,
         model: request.model,
-        status: 500,
+        status: (signal?.aborted || errMsg.includes('CLIENT_ABORT')) ? 499 : 500,
         latency_ms: Date.now() - startTime,
-        error_code: 'STREAM_ERROR',
+        error_code: (signal?.aborted || errMsg.includes('CLIENT_ABORT')) ? 'CLIENT_ABORTED' : 'STREAM_ERROR',
         created_at: new Date().toISOString(),
       });
       throw err;

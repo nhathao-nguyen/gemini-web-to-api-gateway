@@ -152,6 +152,9 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
     if (errMsg.includes('MODEL_NOT_ALLOWED')) {
       statusCode = 403;
       errCode = 'model_not_available';
+    } else if (errMsg.includes('INVALID_REQUEST') || errMsg.includes('FILE_ACCOUNT_MISMATCH')) {
+      statusCode = 400;
+      errCode = 'invalid_request_error';
     } else if (errMsg.includes('NO_HEALTHY_ACCOUNTS')) {
       statusCode = 503;
       errCode = 'no_healthy_accounts';
@@ -188,7 +191,24 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
     return res.json(response);
   } catch (err: any) {
     const errMsg = redactString(err.message || String(err));
-    return res.status(500).json(OpenAIAdapter.formatError(errMsg, 'image_generation_failed', 'gateway_error'));
+    let statusCode = 500;
+    let errCode = 'image_generation_failed';
+
+    if (errMsg.includes('MODEL_NOT_ALLOWED')) {
+      statusCode = 403;
+      errCode = 'model_not_available';
+    } else if (errMsg.includes('NO_HEALTHY_ACCOUNTS')) {
+      statusCode = 503;
+      errCode = 'no_healthy_accounts';
+    } else if (errMsg.includes('SESSION_EXPIRED')) {
+      statusCode = 502;
+      errCode = 'upstream_auth_expired';
+    } else if (errMsg.includes('QUOTA_EXHAUSTED')) {
+      statusCode = 429;
+      errCode = 'upstream_quota_exhausted';
+    }
+
+    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode, 'gateway_error'));
   } finally {
     await rateLimiter.release(apiKey.id);
   }
@@ -238,12 +258,25 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
       mime_type || 'application/octet-stream',
       buffer
     );
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+    db.saveUploadedFile({
+      id: uploaded.id,
+      account_id: targetAccount.id,
+      name: uploaded.name,
+      mime_type: mime_type || 'application/octet-stream',
+      size: buffer.length,
+      created_at: now.toISOString(),
+      expires_at: expiresAt,
+    });
+
     return res.json({
       id: uploaded.id,
       name: uploaded.name,
       size: buffer.length,
       mime_type: mime_type || 'application/octet-stream',
-      created_at: new Date().toISOString(),
+      created_at: now.toISOString(),
     });
   } catch (err: any) {
     return res.status(500).json(OpenAIAdapter.formatError(err.message || 'File upload failed', 'upload_failed'));

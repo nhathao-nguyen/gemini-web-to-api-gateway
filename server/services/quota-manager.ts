@@ -1,23 +1,14 @@
 import crypto from 'crypto';
 import { db } from '../db/database.js';
 import { AccountStatus } from '../types.js';
+import { geminiProvider } from './gemini-adapter/index.js';
 
 export class QuotaManager {
   /**
    * Handle successful request completion on an account
    */
   public recordSuccess(accountId: string) {
-    const account = db.getAccountById(accountId);
-    if (!account) return;
-
-    db.updateAccount(accountId, {
-      status: 'ACTIVE',
-      consecutive_errors: 0,
-      last_error: null,
-      cooldown_until: null,
-      last_success_at: new Date().toISOString(),
-      request_count: account.request_count + 1,
-    });
+    db.recordAccountSuccess(accountId);
   }
 
   /**
@@ -34,7 +25,9 @@ export class QuotaManager {
       errMsg.includes('AbortError') ||
       errMsg.includes('This operation was aborted') ||
       errMsg.includes('ERR_ABORTED') ||
-      errMsg.includes('The user aborted a request')
+      errMsg.includes('The user aborted a request') ||
+      errMsg.includes('CLIENT_ABORT') ||
+      errMsg.includes('aborted by client')
     ) {
       return;
     }
@@ -48,6 +41,7 @@ export class QuotaManager {
     if (errMsg.includes('SESSION_EXPIRED') || errMsg.includes('upstream_auth_expired')) {
       newStatus = 'SESSION_EXPIRED';
       reason = 'Google Gemini session invalid or expired';
+      geminiProvider.invalidateSession(accountId);
     } else if (errMsg.includes('QUOTA_EXHAUSTED') || errMsg.includes('429')) {
       newStatus = 'QUOTA_EXHAUSTED';
       // Cooldown for 15 minutes on quota exhaustion

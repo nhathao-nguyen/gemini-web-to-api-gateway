@@ -235,7 +235,7 @@ adminRouter.post('/accounts', (req: Request, res: Response) => {
 
 adminRouter.patch('/accounts/:id', (req: Request, res: Response) => {
   const { id } = req.params;
-  const { name, email_label, priority, weight, supported_models, proxy_url } = req.body;
+  const { name, email_label, priority, weight, supported_models, proxy_url, auth_user } = req.body;
 
   const updates: any = {};
   if (name !== undefined) updates.name = name.trim();
@@ -244,6 +244,7 @@ adminRouter.patch('/accounts/:id', (req: Request, res: Response) => {
   if (weight !== undefined) updates.weight = parseInt(weight, 10);
   if (supported_models !== undefined && Array.isArray(supported_models)) updates.supported_models = supported_models;
   if (proxy_url !== undefined) updates.proxy_url = proxy_url ? proxy_url.trim() : null;
+  if (auth_user !== undefined) updates.auth_user = String(auth_user).trim();
 
   const updated = accountManager.updateAccount(id, updates);
   if (!updated) {

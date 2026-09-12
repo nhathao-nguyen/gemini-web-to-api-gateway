@@ -12,6 +12,10 @@ export class GeminiProviderRouter implements AIProvider {
     return this.webProvider.ValidateSession(account);
   }
 
+  public invalidateSession(accountId: string): boolean {
+    return this.webProvider.invalidateSession(accountId);
+  }
+
   public async ChatCompletion(
     account: GeminiAccount,
     request: ChatCompletionRequest,

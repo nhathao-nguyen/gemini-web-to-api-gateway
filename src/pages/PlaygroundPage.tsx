@@ -76,14 +76,9 @@ export const PlaygroundPage: React.FC = () => {
   // Model from URL param
   const modelParam = searchParams.get('model') || '';
 
-  // Manual key saved in sessionStorage / localStorage
-  const [manualKey, setManualKey] = useState<string>(() => {
-    try {
-      return sessionStorage.getItem('gmgw_playground_key') || localStorage.getItem('gmgw_playground_key') || '';
-    } catch {
-      return '';
-    }
-  });
+  // Playground API key is held strictly in React memory for this page session.
+  // Never stored in localStorage or sessionStorage.
+  const [manualKey, setManualKey] = useState<string>('');
 
   const [prompt, setPrompt] = useState<string>('');
   const [stream, setStream] = useState(true);
@@ -239,13 +234,9 @@ export const PlaygroundPage: React.FC = () => {
     });
   }, [turns, streamingText, streamingReasoning, isLoading, errorText]);
 
-  // Persist key
+  // Store key in React memory only
   const handleKeyChange = (val: string) => {
-    setManualKey(val);
-    try {
-      sessionStorage.setItem('gmgw_playground_key', val);
-      localStorage.setItem('gmgw_playground_key', val);
-    } catch {}
+    setManualKey(val.trim());
   };
 
   // Sync selected model with URL
@@ -650,7 +641,7 @@ export const PlaygroundPage: React.FC = () => {
                 className="w-full px-3 py-2 border border-zinc-200 rounded-xl text-xs font-mono text-zinc-800 focus:ring-2 focus:ring-zinc-900 focus:outline-none bg-zinc-50 focus:bg-white"
               />
               <p className="text-[11px] text-zinc-400 mt-1">
-                Bearer API Key created in Admin API Keys tab.
+                Bearer API Key từ trang Quản lý Khóa API. Key chỉ lưu tạm trong bộ nhớ phiên này (sẽ cần nhập lại sau khi tải lại trang, không lưu browser storage).
               </p>
             </div>
 
@@ -726,10 +717,10 @@ export const PlaygroundPage: React.FC = () => {
               />
             </div>
 
-            <div>
-              <div className="flex items-center justify-between text-xs font-medium text-zinc-700 mb-1">
+            <div className="opacity-75">
+              <div className="flex items-center justify-between text-xs font-medium text-zinc-600 mb-1">
                 <span>Temperature</span>
-                <span className="font-mono text-zinc-500">{temperature}</span>
+                <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">Không hỗ trợ (Gemini Web)</span>
               </div>
               <input
                 type="range"
@@ -737,8 +728,8 @@ export const PlaygroundPage: React.FC = () => {
                 max="1.5"
                 step="0.1"
                 value={temperature}
-                onChange={(e) => setTemperature(parseFloat(e.target.value))}
-                className="w-full accent-zinc-900"
+                disabled
+                className="w-full cursor-not-allowed opacity-50"
               />
             </div>
 

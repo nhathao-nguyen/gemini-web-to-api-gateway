@@ -59,10 +59,6 @@ export const ApiKeysPage: React.FC = () => {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['api-keys'] });
       setCreatedPlainKey(data.apiKey);
-      try {
-        localStorage.setItem('gmgw_playground_key', data.apiKey);
-        sessionStorage.setItem('gmgw_playground_key', data.apiKey);
-      } catch {}
       setIsCreateModalOpen(false);
       setName('');
     },

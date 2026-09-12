@@ -11,6 +11,7 @@ import { normalizeCookieString } from '../../utils/cookie.js';
 import { encryptCookie, decryptCookie } from '../../utils/crypto.js';
 import { config } from '../../config.js';
 import { geminiAccountUrl } from '../gemini-adapter/gemini-web.js';
+import { geminiProvider } from '../gemini-adapter/index.js';
 
 export interface KeepAliveReport {
   isWorkerRunning: boolean;
@@ -251,6 +252,7 @@ export class KeepAliveWorker {
       // 3. Check for auth redirect
       if (isGoogleLoginUrl(finalUrl)) {
         console.warn(`[KeepAliveWorker] Account ${account.name} session has expired (Redirected to Google Login).`);
+        geminiProvider.invalidateSession(accountId);
         db.updateAccount(accountId, {
           status: 'SESSION_EXPIRED',
           keepalive_status: 'FAILED',
@@ -345,6 +347,8 @@ export class KeepAliveWorker {
       const nowStr = new Date().toISOString();
 
 
+      geminiProvider.invalidateSession(accountId);
+
       db.updateAccount(accountId, {
         status: account.status === 'SESSION_EXPIRED' ? 'ACTIVE' : account.status,
         encrypted_cookie: encryptedCookie,
@@ -377,6 +381,10 @@ export class KeepAliveWorker {
       console.error(`[KeepAliveWorker] Failed keep-alive for ${account.name}:`, err.message);
       const nowStr = new Date().toISOString();
       const isSessionExpired = String(err.message || '').includes('SESSION_EXPIRED');
+
+      if (isSessionExpired) {
+        geminiProvider.invalidateSession(accountId);
+      }
 
       db.updateAccount(accountId, {
         ...(isSessionExpired ? { status: 'SESSION_EXPIRED' as const } : {}),

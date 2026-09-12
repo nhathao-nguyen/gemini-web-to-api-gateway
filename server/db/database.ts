@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import pg from 'pg';
 import { DatabaseSync } from 'node:sqlite';
-import { GeminiAccount, ApiKey, RequestLog, AccountEvent, Conversation, Message, MediaCache } from '../types.js';
+import { GeminiAccount, AccountStatus, ApiKey, RequestLog, AccountEvent, Conversation, Message, MediaCache, UploadedFileRecord } from '../types.js';
 import { config } from '../config.js';
 
 const { Pool } = pg;
@@ -15,6 +15,7 @@ interface DatabaseData {
   conversations: Conversation[];
   messages: Message[];
   media_cache: MediaCache[];
+  uploaded_files: UploadedFileRecord[];
   settings: Record<string, any>;
 }
 
@@ -39,6 +40,7 @@ export class Database {
       conversations: [],
       messages: [],
       media_cache: [],
+      uploaded_files: [],
       settings: {
         request_body_logging: false,
         max_upstream_attempts: 2,
@@ -187,6 +189,16 @@ export class Database {
           data_b64 TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+          size INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
       `);
 
       // SQLite column migrations
@@ -332,6 +344,19 @@ export class Database {
         }));
       }
 
+      const fileRows = this.sqliteDb.prepare('SELECT * FROM uploaded_files').all();
+      if (fileRows && fileRows.length > 0) {
+        this.data.uploaded_files = fileRows.map((f: any) => ({
+          id: f.id,
+          account_id: f.account_id,
+          name: f.name,
+          mime_type: f.mime_type,
+          size: Number(f.size || 0),
+          created_at: f.created_at,
+          expires_at: f.expires_at,
+        }));
+      }
+
       this.isSqliteReady = true;
       console.log(
         `[Database] SQLite ready. Loaded ${this.data.accounts.length} accounts, ${this.data.api_keys.length} API keys, and ${this.data.conversations.length} conversations from gateway.db.`
@@ -446,13 +471,185 @@ export class Database {
     return this.isSqliteReady;
   }
 
+  public transaction<T>(fn: () => T): T {
+    if (this.isSqliteReady && this.sqliteDb) {
+      this.sqliteDb.exec('BEGIN IMMEDIATE');
+      try {
+        const result = fn();
+        this.sqliteDb.exec('COMMIT');
+        return result;
+      } catch (err) {
+        this.sqliteDb.exec('ROLLBACK');
+        throw err;
+      }
+    }
+    return fn();
+  }
+
   // --- ACCOUNTS ---
   public getAccounts(): GeminiAccount[] {
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        const rows = this.sqliteDb.prepare('SELECT * FROM accounts').all();
+        if (rows && rows.length > 0) {
+          this.data.accounts = rows.map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            email_label: r.email_label,
+            encrypted_cookie: r.encrypted_cookie,
+            auth_user: r.auth_user || '0',
+            status: r.status,
+            priority: Number(r.priority || 10),
+            weight: Number(r.weight || 1),
+            supported_models: JSON.parse(r.supported_models || '[]'),
+            proxy_url: r.proxy_url || null,
+            profile_dir: r.profile_dir || null,
+            user_agent: r.user_agent || null,
+            locale: r.locale || 'en-US',
+            timezone: r.timezone || 'America/New_York',
+            last_keepalive_at: r.last_keepalive_at || null,
+            keepalive_status: r.keepalive_status || 'IDLE',
+            last_success_at: r.last_success_at || null,
+            last_error_at: r.last_error_at || null,
+            last_error: r.last_error || null,
+            cooldown_until: r.cooldown_until || null,
+            consecutive_errors: Number(r.consecutive_errors || 0),
+            request_count: Number(r.request_count || 0),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+          }));
+        }
+      } catch (err) {
+        console.warn('[Database] SQLite getAccounts error:', err);
+      }
+    }
     return [...this.data.accounts];
   }
 
   public getAccountById(id: string): GeminiAccount | undefined {
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        const r = this.sqliteDb.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+        if (r) {
+          const acc: GeminiAccount = {
+            id: r.id,
+            name: r.name,
+            email_label: r.email_label,
+            encrypted_cookie: r.encrypted_cookie,
+            auth_user: r.auth_user || '0',
+            status: r.status,
+            priority: Number(r.priority || 10),
+            weight: Number(r.weight || 1),
+            supported_models: JSON.parse(r.supported_models || '[]'),
+            proxy_url: r.proxy_url || null,
+            profile_dir: r.profile_dir || null,
+            user_agent: r.user_agent || null,
+            locale: r.locale || 'en-US',
+            timezone: r.timezone || 'America/New_York',
+            last_keepalive_at: r.last_keepalive_at || null,
+            keepalive_status: r.keepalive_status || 'IDLE',
+            last_success_at: r.last_success_at || null,
+            last_error_at: r.last_error_at || null,
+            last_error: r.last_error || null,
+            cooldown_until: r.cooldown_until || null,
+            consecutive_errors: Number(r.consecutive_errors || 0),
+            request_count: Number(r.request_count || 0),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+          };
+          const idx = this.data.accounts.findIndex((a) => a.id === id);
+          if (idx !== -1) {
+            this.data.accounts[idx] = acc;
+          } else {
+            this.data.accounts.push(acc);
+          }
+          return acc;
+        }
+      } catch (err) {
+        console.warn('[Database] SQLite getAccountById error:', err);
+      }
+    }
     return this.data.accounts.find((a) => a.id === id);
+  }
+
+  public recordAccountSuccess(id: string): void {
+    const now = new Date().toISOString();
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        this.sqliteDb
+          .prepare(
+            `UPDATE accounts SET
+              request_count = request_count + 1,
+              consecutive_errors = 0,
+              last_error = NULL,
+              cooldown_until = NULL,
+              status = 'ACTIVE',
+              last_success_at = ?,
+              updated_at = ?
+            WHERE id = ?`
+          )
+          .run(now, now, id);
+      } catch (err) {
+        console.error('[Database] SQLite recordAccountSuccess error:', err);
+      }
+    }
+
+    const cached = this.data.accounts.find((a) => a.id === id);
+    if (cached) {
+      cached.request_count += 1;
+      cached.consecutive_errors = 0;
+      cached.last_error = null;
+      cached.cooldown_until = null;
+      cached.status = 'ACTIVE';
+      cached.last_success_at = now;
+      cached.updated_at = now;
+    }
+  }
+
+  public recordAccountError(
+    id: string,
+    errMsg: string,
+    newStatus: AccountStatus,
+    cooldownUntil: string | null
+  ): number {
+    const now = new Date().toISOString();
+    let consecutive = 1;
+
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        this.sqliteDb
+          .prepare(
+            `UPDATE accounts SET
+              consecutive_errors = consecutive_errors + 1,
+              last_error = ?,
+              last_error_at = ?,
+              status = ?,
+              cooldown_until = ?,
+              updated_at = ?
+            WHERE id = ?`
+          )
+          .run(errMsg, now, newStatus, cooldownUntil, now, id);
+
+        const row = this.sqliteDb.prepare('SELECT consecutive_errors FROM accounts WHERE id = ?').get(id);
+        if (row && typeof row.consecutive_errors === 'number') {
+          consecutive = row.consecutive_errors;
+        }
+      } catch (err) {
+        console.error('[Database] SQLite recordAccountError error:', err);
+      }
+    }
+
+    const cached = this.data.accounts.find((a) => a.id === id);
+    if (cached) {
+      cached.consecutive_errors = consecutive;
+      cached.last_error = errMsg;
+      cached.last_error_at = now;
+      cached.status = newStatus;
+      cached.cooldown_until = cooldownUntil;
+      cached.updated_at = now;
+    }
+
+    return consecutive;
   }
 
   public createAccount(account: GeminiAccount): GeminiAccount {
@@ -825,16 +1022,21 @@ export class Database {
 
   // --- LOGS & EVENTS ---
   public addRequestLog(log: RequestLog) {
-    this.data.request_logs.unshift(log);
-    if (this.data.request_logs.length > 1000) {
-      this.data.request_logs = this.data.request_logs.slice(0, 1000);
+    const existingIdx = this.data.request_logs.findIndex((l) => l.request_id === log.request_id);
+    if (existingIdx !== -1) {
+      this.data.request_logs[existingIdx] = log;
+    } else {
+      this.data.request_logs.unshift(log);
+      if (this.data.request_logs.length > 1000) {
+        this.data.request_logs = this.data.request_logs.slice(0, 1000);
+      }
     }
 
     if (this.isSqliteReady && this.sqliteDb) {
       try {
         this.sqliteDb
           .prepare(
-            `INSERT INTO request_logs (request_id, api_key_id, account_id, model, status, latency_ms, error_code, created_at)
+            `INSERT OR REPLACE INTO request_logs (request_id, api_key_id, account_id, model, status, latency_ms, error_code, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
@@ -848,7 +1050,7 @@ export class Database {
             log.created_at
           );
       } catch (err) {
-        console.error('[Database] SQLite insert request_log error:', err);
+        console.error('[Database] SQLite insert/replace request_log error:', err);
       }
     }
 
@@ -1220,6 +1422,116 @@ export class Database {
       requestsByAccount,
       requestsByApiKey,
     };
+  }
+
+  // --- UPLOADED FILES & RETENTION ---
+  public saveUploadedFile(file: UploadedFileRecord): void {
+    const existingIdx = this.data.uploaded_files.findIndex((f) => f.id === file.id);
+    if (existingIdx !== -1) {
+      this.data.uploaded_files[existingIdx] = file;
+    } else {
+      this.data.uploaded_files.push(file);
+    }
+
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        this.sqliteDb
+          .prepare(
+            `INSERT OR REPLACE INTO uploaded_files (id, account_id, name, mime_type, size, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(file.id, file.account_id, file.name, file.mime_type, file.size, file.created_at, file.expires_at);
+      } catch (err) {
+        console.error('[Database] SQLite save uploaded_file error:', err);
+      }
+    }
+  }
+
+  public getUploadedFile(id: string): UploadedFileRecord | undefined {
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        const row = this.sqliteDb.prepare('SELECT * FROM uploaded_files WHERE id = ?').get(id);
+        if (row) {
+          const rec: UploadedFileRecord = {
+            id: row.id,
+            account_id: row.account_id,
+            name: row.name,
+            mime_type: row.mime_type,
+            size: Number(row.size || 0),
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+          };
+          const idx = this.data.uploaded_files.findIndex((f) => f.id === id);
+          if (idx !== -1) {
+            this.data.uploaded_files[idx] = rec;
+          } else {
+            this.data.uploaded_files.push(rec);
+          }
+          return rec;
+        }
+      } catch (err) {
+        console.warn('[Database] SQLite getUploadedFile error:', err);
+      }
+    }
+    return this.data.uploaded_files.find((f) => f.id === id);
+  }
+
+  public cleanupRetention(): { logsDeleted: number; eventsDeleted: number; mediaDeleted: number; filesDeleted: number } {
+    let logsDeleted = 0;
+    let eventsDeleted = 0;
+    let mediaDeleted = 0;
+    let filesDeleted = 0;
+
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        // Keep max 10,000 logs or 14 days
+        const logRes = this.sqliteDb
+          .prepare(
+            `DELETE FROM request_logs
+             WHERE request_id NOT IN (
+               SELECT request_id FROM request_logs ORDER BY created_at DESC LIMIT 10000
+             ) OR created_at < datetime('now', '-14 days')`
+          )
+          .run();
+        logsDeleted = Number(logRes.changes || 0);
+
+        // Keep max 5,000 events or 14 days
+        const evtRes = this.sqliteDb
+          .prepare(
+            `DELETE FROM account_events
+             WHERE id NOT IN (
+               SELECT id FROM account_events ORDER BY created_at DESC LIMIT 5000
+             ) OR created_at < datetime('now', '-14 days')`
+          )
+          .run();
+        eventsDeleted = Number(evtRes.changes || 0);
+
+        // Keep max 1,000 media or 7 days
+        const mediaRes = this.sqliteDb
+          .prepare(
+            `DELETE FROM media_cache
+             WHERE id NOT IN (
+               SELECT id FROM media_cache ORDER BY created_at DESC LIMIT 1000
+             ) OR created_at < datetime('now', '-7 days')`
+          )
+          .run();
+        mediaDeleted = Number(mediaRes.changes || 0);
+
+        // Expired uploaded files
+        const fileRes = this.sqliteDb
+          .prepare(`DELETE FROM uploaded_files WHERE expires_at < datetime('now')`)
+          .run();
+        filesDeleted = Number(fileRes.changes || 0);
+
+        // Sync in-memory uploaded_files
+        const nowIso = new Date().toISOString();
+        this.data.uploaded_files = this.data.uploaded_files.filter((f) => f.expires_at >= nowIso);
+      } catch (err) {
+        console.warn('[Database] SQLite retention cleanup warning:', err);
+      }
+    }
+
+    return { logsDeleted, eventsDeleted, mediaDeleted, filesDeleted };
   }
 }
 
