@@ -5,6 +5,7 @@ node_modules/
 
 # Production build output
 dist/
+dist-electron/
 dist-ssr/
 build/
 coverage/
@@ -29,6 +30,7 @@ browser-profiles/
 .env.staging
 .env.test
 !.env.example
+.masterkey
 
 # Logs & debugging
 logs/

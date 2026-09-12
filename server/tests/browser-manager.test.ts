@@ -1,6 +1,5 @@
 import assert from 'assert';
-import { parseProxy, getProfileDir, DEFAULT_USER_AGENT } from '../services/browser-manager/stealth-factory.js';
-import { browserOnboardingService } from '../services/browser-manager/onboarding-service.js';
+import { parseProxy, getProfileDir, getProfileBaseDir } from '../services/browser-manager/stealth-factory.js';
 import { keepAliveWorker } from '../services/browser-manager/keepalive-worker.js';
 import { db } from '../db/database.js';
 
@@ -19,6 +18,12 @@ async function test(name: string, fn: () => void | Promise<void>) {
 }
 
 async function runTests() {
+  // Isolated temp DB: never touch the real desktop gateway.db.
+  const os = await import('os');
+  const path = await import('path');
+  const fs = await import('fs');
+  const isolatedDir = fs.default.mkdtempSync(path.default.join(os.default.tmpdir(), 'gw-bm-test-'));
+  db.initializeSqlite(path.default.join(isolatedDir, 'test-browser.db'));
   await db.init();
 
   // Test 1: Proxy Parser
@@ -73,25 +78,113 @@ async function runTests() {
     assert.ok(res.message.includes('not found'));
   });
 
-  // Test 4: Browser Onboarding Service
-  await test('browserOnboardingService starts session with correct parameters', async () => {
-    const session = await browserOnboardingService.startSession({
-      name: 'Test Onboard Acc',
-      emailLabel: 'test@gmail.com',
-      priority: 20,
-      weight: 5,
-    });
+  // Test 4: Desktop login moved to Electron (login.ts). The Playwright
+  // onboarding service was removed; profile dirs follow GATEWAY_PROFILE_DIR.
+  await test('getProfileDir honors GATEWAY_PROFILE_DIR override', async () => {
+    const prev = process.env.GATEWAY_PROFILE_DIR;
+    const path = await import('path');
+    const overrideDir = path.join('gw-profiles-test-override');
+    process.env.GATEWAY_PROFILE_DIR = overrideDir;
+    try {
+      assert.strictEqual(getProfileBaseDir(), overrideDir);
+      assert.ok(getProfileDir('acc_x').startsWith(path.resolve(overrideDir)));
+    } finally {
+      if (prev === undefined) delete process.env.GATEWAY_PROFILE_DIR;
+      else process.env.GATEWAY_PROFILE_DIR = prev;
+    }
+  });
 
-    assert.ok(session.sessionId.startsWith('onboard_'));
-    assert.strictEqual(session.name, 'Test Onboard Acc');
-    assert.strictEqual(session.priority, 20);
-    assert.strictEqual(session.weight, 5);
+  await test('desktop login store completes external session with valid cookie', async () => {
+    const { createPendingLogin, consumeCaptureToken, completeLoginWithCookie } = await import(
+      '../services/browser-manager/desktop-login-store.js'
+    );
+    const pending = createPendingLogin({ mode: 'external', name: 'Ext Test Acc', emailLabel: 'ext@test.com' });
+    assert.ok(pending.sessionId.startsWith('login_'));
+    assert.ok(pending.captureToken.startsWith('cap_'));
+    assert.strictEqual(pending.mode, 'external');
 
-    // Cancel to clean up
-    await browserOnboardingService.cancelSession(session.sessionId);
-    const updated = browserOnboardingService.getSession(session.sessionId);
-    assert.ok(updated);
-    assert.strictEqual(updated.step, 'CANCELLED');
+    const viaToken = consumeCaptureToken(pending.captureToken);
+    assert.ok(viaToken);
+    assert.strictEqual(viaToken.sessionId, pending.sessionId);
+    // Single-use: second consume fails
+    assert.strictEqual(consumeCaptureToken(pending.captureToken), undefined);
+
+    // Re-arm not needed on success path; complete with a fresh valid cookie
+    const done = completeLoginWithCookie(pending.sessionId, '__Secure-1PSID=psid_ext_1; __Secure-1PSIDTS=ts_ext_1');
+    assert.strictEqual(done.step, 'COMPLETED');
+    assert.ok(done.account);
+    db.deleteAccount(done.account.id);
+  });
+
+  await test('desktop login store rejects invalid cookie and unknown token', async () => {
+    const { createPendingLogin, consumeCaptureToken, completeLoginWithCookie } = await import(
+      '../services/browser-manager/desktop-login-store.js'
+    );
+    assert.strictEqual(consumeCaptureToken('cap_nonexistent'), undefined);
+    const pending = createPendingLogin({ mode: 'external', name: 'Ext Bad Cookie' });
+    let threw = false;
+    try {
+      completeLoginWithCookie(pending.sessionId, 'garbage-no-cookie');
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw);
+    const { cancelLoginSession, getLoginSession } = await import(
+      '../services/browser-manager/desktop-login-store.js'
+    );
+    assert.ok(cancelLoginSession(pending.sessionId));
+    assert.strictEqual(getLoginSession(pending.sessionId)?.step, 'CANCELLED');
+  });
+
+  await test('chrome profile discovery lists cookie-bearing profiles', async () => {
+    const fs = await import('fs');
+    const os = await import('os');
+    const path = await import('path');
+    const { listChromeProfiles, snapshotFileList, mergeCookiesToHeader } = await import(
+      '../services/browser-manager/profile-snapshot.js'
+    );
+    const root = fs.default.mkdtempSync(path.default.join(os.default.tmpdir(), 'gw-prof-test-'));
+    try {
+      fs.default.mkdirSync(path.default.join(root, 'Default', 'Network'), { recursive: true });
+      fs.default.writeFileSync(path.default.join(root, 'Default', 'Network', 'Cookies'), 'x');
+      fs.default.mkdirSync(path.default.join(root, 'Profile 1', 'Network'), { recursive: true });
+      fs.default.writeFileSync(path.default.join(root, 'Profile 1', 'Network', 'Cookies'), 'x');
+      fs.default.mkdirSync(path.default.join(root, 'Profile 9'));
+      fs.default.writeFileSync(path.default.join(root, 'Local State'), '{}');
+      assert.deepStrictEqual(listChromeProfiles(root), ['Default', 'Profile 1']);
+      assert.ok(snapshotFileList('Default').includes('Local State'));
+      assert.strictEqual(
+        mergeCookiesToHeader([
+          { name: 'A', value: '1' },
+          { name: 'A', value: '2' },
+          { name: 'B', value: '3' },
+        ]),
+        'A=2; B=3'
+      );
+    } finally {
+      fs.default.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('desktop login session shape is compatible with UI polling', async () => {
+    // Static contract check: the store owns the step machine the renderer
+    // polls (INITIALIZING..COMPLETED/CANCELLED/TIMED_OUT/ERROR) and the
+    // Electron shell drives it (no overlapping setInterval anywhere).
+    const fs = await import('fs');
+    const path = await import('path');
+    const storeCode = fs.default.readFileSync(
+      path.default.join(process.cwd(), 'server', 'services', 'browser-manager', 'desktop-login-store.ts'),
+      'utf-8'
+    );
+    for (const step of ['INITIALIZING', 'WAITING_LOGIN', 'EXTRACTING', 'COMPLETED', 'CANCELLED', 'TIMED_OUT', 'ERROR']) {
+      assert.ok(storeCode.includes(`'${step}'`), `login store covers step ${step}`);
+    }
+    const loginCode = fs.default.readFileSync(
+      path.default.join(process.cwd(), 'electron', 'login.ts'),
+      'utf-8'
+    );
+    assert.ok(loginCode.includes('desktop-login-store.js'), 'electron login shell drives the shared store');
+    assert.ok(!loginCode.includes('setInterval('), 'login shell uses no overlapping setInterval polling');
   });
 
   console.log(`\n========================================`);

@@ -1,7 +1,5 @@
 import { Router, Request, Response } from 'express';
 import { db } from '../db/database.js';
-import { rateLimiter } from '../services/rate-limiter.js';
-import { accountScheduler } from '../services/scheduler.js';
 
 export const observabilityRouter = Router();
 
@@ -14,19 +12,15 @@ observabilityRouter.get('/health', (req: Request, res: Response) => {
 });
 
 observabilityRouter.get('/ready', (req: Request, res: Response) => {
-  const isDbOk = db.isPostgresConnected() || !process.env.DATABASE_URL;
-  const redisDiag = rateLimiter.getDiagnostics();
-  const isRedisOk = redisDiag.connected || !process.env.REDIS_URL;
+  // Desktop: SQLite is the only store — report its real state.
+  const isDbOk = db.isSqliteConnected();
+  const dbStatus = isDbOk ? 'ok' : 'degraded';
 
-  const dbStatus = db.isPostgresConnected() ? 'ok' : (!process.env.DATABASE_URL ? 'ok' : 'degraded');
-  const redisStatus = redisDiag.connected ? 'ok' : (!process.env.REDIS_URL ? 'ok' : 'degraded');
-
-  const isReady = isDbOk && isRedisOk;
+  const isReady = isDbOk;
 
   return res.status(isReady ? 200 : 503).json({
     status: isReady ? 'ready' : 'degraded',
-    database: dbStatus,
-    redis: redisStatus,
+    database: `sqlite:${dbStatus}`,
   });
 });
 

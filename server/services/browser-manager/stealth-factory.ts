@@ -60,9 +60,16 @@ export function parseProxy(proxyUrl?: string | null): ParsedProxy | undefined {
   }
 }
 
+export function getProfileBaseDir(): string {
+  // Desktop shell points this at <userData>/browser-profiles; standalone
+  // mode falls back to the working directory.
+  const override = (process.env.GATEWAY_PROFILE_DIR || '').trim();
+  return override || path.resolve(process.cwd(), 'browser-profiles');
+}
+
 export function getProfileDir(accountId: string): string {
   const sanitized = accountId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return path.resolve(process.cwd(), 'browser-profiles', sanitized);
+  return path.resolve(getProfileBaseDir(), sanitized);
 }
 
 export async function cleanupProfileDir(accountId: string): Promise<boolean> {

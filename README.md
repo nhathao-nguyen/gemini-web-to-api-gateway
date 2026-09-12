@@ -1,6 +1,6 @@
-# Gemini Web-to-API Gateway
+# Gemini Web-to-API Gateway (Desktop)
 
-A production-grade gateway server that transforms operator-provided `gemini.google.com` browser sessions into standard, OpenAI-compatible REST and streaming APIs (`/v1/models`, `/v1/chat/completions`).
+A desktop app (Electron) that pools the web quota of many `gemini.google.com` accounts into one quota pool and shares it on your LAN as standard, OpenAI-compatible REST and streaming APIs (`/v1/models`, `/v1/chat/completions`). There is **no website** — all management happens in the desktop UI, which talks to the built-in gateway via IPC.
 
 Based on the architecture and concepts of [`ntthanh2603/gemini-web-to-api`](https://github.com/ntthanh2603/gemini-web-to-api).
 
@@ -31,35 +31,38 @@ Based on the architecture and concepts of [`ntthanh2603/gemini-web-to-api`](http
    - In-flight **Concurrent Request Limiter**.
    - **Daily Quota Limiter**.
 
-5. **Observability & Admin UI**:
+5. **Observability & Desktop UI**:
    - `/health`, `/ready`, and Prometheus `/metrics`.
-   - Full Admin Dashboard built with React, Vite, and Tailwind CSS.
+   - Full management UI built with React, Vite, and Tailwind CSS, running inside Electron (IPC, no website).
    - Live interactive Playground to test chat completions and streaming.
 
 ---
 
-## 🚀 Quick Start with Docker Compose
+## 🚀 Quick Start (Desktop)
 
-```bash
-# Clone the repository
-git clone https://github.com/example/gemini-web-to-api.git
-cd gemini-web-to-api
-
-# Configure environment variables
-cp .env.example .env
-
-# Build and start services (gateway, isolated postgresql, and isolated redis)
-docker compose build
-docker compose up -d
+```bat
+:: Windows: build the renderer + gateway and launch the desktop app
+start.bat
 ```
 
-The gateway binds to `0.0.0.0:3000` and will be accessible across your local machine and LAN:
-- **Web Admin Dashboard**: `http://localhost:3000` or `http://<SERVER_LAN_IP>:3000`
-- **OpenAI API Base URL**: `http://localhost:3000/v1` or `http://<SERVER_LAN_IP>:3000/v1`
-- **Health Checks**: `http://<SERVER_LAN_IP>:3000/health` and `http://<SERVER_LAN_IP>:3000/ready`
-- **Metrics**: `http://<SERVER_LAN_IP>:3000/metrics`
+Or manually:
 
-*(PostgreSQL and Redis are strictly internal to the Docker bridge network and not exposed to the host/LAN).*
+```bash
+npm install
+npm run build        # renderer (dist/) + gateway bundle
+npm run dev:electron # launch Electron (main + IPC + in-process gateway)
+```
+
+Data lives in the app's userData directory (SQLite `gateway.db`, `.masterkey` key file, `browser-profiles/`).
+No Docker, no Postgres, no Redis — single-process by design.
+
+By default the gateway binds to `127.0.0.1:3000` (this machine only):
+- **Desktop UI**: the app window itself (no browser/URL needed)
+- **OpenAI API Base URL**: `http://127.0.0.1:3000/v1`
+- **Health Checks**: `http://127.0.0.1:3000/health` and `http://127.0.0.1:3000/ready`
+
+To share the quota pool on your LAN: **Settings → Chia sẻ trong LAN → Bật**, then restart the app.
+It rebinds to `0.0.0.0:3000` and LAN clients use `http://<YOUR_LAN_IP>:3000/v1` with an `sk-gmgw-...` key you create in the API Keys tab.
 
 ---
 
@@ -204,17 +207,29 @@ server {
 
 ---
 
-## 🔐 How to Obtain Gemini Web Cookies
+## 🔐 How to Add a Google Account (your real Chrome)
 
-1. Open your browser and log into [gemini.google.com](https://gemini.google.com).
-2. Press `F12` to open Developer Tools, then navigate to the **Application** (or **Storage**) tab.
-3. Under **Cookies** -> `https://gemini.google.com`, copy the values of:
-   - `__Secure-1PSID`
-   - `__Secure-1PSIDTS`
-   - (Optional) `__Secure-1PSIDCC`
-4. In the Gateway Admin Dashboard (**Accounts** tab), click **Add Account**, paste the cookie string, e.g.:
+Chrome locks its cookie file while running, so no app can read it live. Pick one:
+
+**A. Without extension (close Chrome once per login):**
+1. In the desktop app: **Accounts → Browser login → Mở Chrome Đăng Nhập**.
+2. The Gemini page opens **in your current Chrome**. Log in with Google / finish 2FA.
+3. **Quit Chrome completely** (including the tray icon), back in the app click
+   **Đã Đăng Nhập Xong — Xác Nhận**. The app copies your profile cookies to a temp dir,
+   reads the Google session via a throwaway headless copy over CDP, then deletes it.
+4. The session flips to COMPLETED and the account joins the quota pool.
+
+**B. Without closing Chrome (one-click extension):**
+1. One-time setup: `chrome://extensions` → Developer mode → **Load unpacked** →
+   select the `extension/` folder.
+2. After logging in, click the **“Gemini Gateway”** icon → **Tải phiên chờ** →
+   pick the session → **Gửi session về app** (localhost, one-time token).
+
+**C. Fallbacks:** **Dùng cửa sổ app** (isolated in-app login window, auto-detect) or
+**Add Account** with a manually pasted cookie:
    ```text
    __Secure-1PSID=xxxx; __Secure-1PSIDTS=yyyy
    ```
-5. Click **Test Session** to verify the upstream handshake and initialize the pool.
+
+Then click **Test Session** to verify the upstream handshake and initialize the pool.
 

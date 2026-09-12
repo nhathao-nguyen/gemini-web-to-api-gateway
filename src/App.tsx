@@ -1,8 +1,9 @@
 import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from './lib/query-client.js';
 import { AdminAuthProvider } from './hooks/useAdminAuth.js';
+import { isDesktopBridge } from './lib/api-client.js';
 
 import { ProtectedLayout } from './layouts/ProtectedLayout.js';
 import { AdminLayout } from './layouts/AdminLayout.js';
@@ -21,10 +22,12 @@ import { SettingsPage } from './pages/SettingsPage.js';
 import { NotFoundPage } from './pages/NotFoundPage.js';
 
 export default function App() {
+  // file:// has no server rewrites — HashRouter keeps deep links working there.
+  const Router = isDesktopBridge() ? HashRouter : BrowserRouter;
   return (
     <QueryClientProvider client={queryClient}>
       <AdminAuthProvider>
-        <BrowserRouter>
+        <Router>
           <Routes>
             {/* Public Login Route */}
             <Route path="/login" element={<LoginPage />} />
@@ -50,7 +53,7 @@ export default function App() {
             {/* 404 Catch-all */}
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
-        </BrowserRouter>
+        </Router>
       </AdminAuthProvider>
     </QueryClientProvider>
   );

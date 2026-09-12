@@ -5,6 +5,9 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // Relative asset base so the built renderer also loads from file://
+    // inside the Electron desktop shell (absolute /assets/* would 404).
+    base: './',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

@@ -41,6 +41,8 @@ import {
   startBrowserOnboarding,
   getBrowserOnboardingStatus,
   cancelBrowserOnboarding,
+  confirmBrowserLogin,
+  isDesktopBridge,
   OnboardingSessionState,
 } from '../lib/api-client.js';
 import { SafeAccount, AccountStatus } from '../types/client.js';
@@ -98,6 +100,7 @@ export const AccountsPage: React.FC = () => {
   const [onboardSession, setOnboardSession] = useState<OnboardingSessionState | null>(null);
   const [onboardError, setOnboardError] = useState<string | null>(null);
   const [onboardStarting, setOnboardStarting] = useState(false);
+  const [onboardConfirming, setOnboardConfirming] = useState(false);
   const pollerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Inline proxy test state for table rows: accountId -> result
@@ -261,13 +264,14 @@ export const AccountsPage: React.FC = () => {
     });
   };
 
-  const handleStartBrowserOnboard = async (e: React.FormEvent) => {
+  const handleStartBrowserOnboard = async (e: React.FormEvent, mode: 'external' | 'window' = 'external') => {
     e.preventDefault();
     setOnboardStarting(true);
     setOnboardError(null);
     try {
       const session = await startBrowserOnboarding({
         accountId: onboardAccountId || undefined,
+        mode,
         name: onboardName.trim() || undefined,
         emailLabel: onboardEmail.trim() || undefined,
         proxyUrl: onboardProxy.trim() || undefined,
@@ -289,6 +293,22 @@ export const AccountsPage: React.FC = () => {
       setOnboardSession((prev) => (prev ? { ...prev, step: 'CANCELLED', message: 'Đã hủy phiên.' } : null));
     } catch (err) {
       console.warn(err);
+    }
+  };
+
+  const handleConfirmBrowserLogin = async () => {
+    if (!onboardSession) return;
+    setOnboardConfirming(true);
+    try {
+      const updated = await confirmBrowserLogin(onboardSession.sessionId);
+      setOnboardSession(updated);
+      if (updated.step === 'COMPLETED') {
+        queryClient.invalidateQueries({ queryKey: ['accounts'] });
+      }
+    } catch (err: any) {
+      setOnboardError(err.message || 'Xác nhận đăng nhập thất bại');
+    } finally {
+      setOnboardConfirming(false);
     }
   };
 
@@ -893,7 +913,7 @@ export const AccountsPage: React.FC = () => {
                   <h3 className="text-base font-bold text-zinc-900">
                     {onboardAccountId ? 'Đăng Nhập Lại Qua Trình Duyệt' : 'Đăng Nhập Google Gemini Qua Trình Duyệt'}
                   </h3>
-                  <span className="text-xs text-zinc-500">Headed Chromium Onboarding • Không lo bị khóa tài khoản</span>
+                  <span className="text-xs text-zinc-500">Đăng nhập bằng Chrome của bạn • Không lo bị khóa tài khoản</span>
                 </div>
               </div>
               <button
@@ -913,10 +933,13 @@ export const AccountsPage: React.FC = () => {
               <form onSubmit={handleStartBrowserOnboard} className="space-y-4 pt-4">
                 <div className="bg-indigo-50/60 border border-indigo-100 rounded-xl p-3.5 text-xs text-indigo-900 leading-relaxed space-y-1">
                   <p className="font-semibold flex items-center gap-1.5">
-                    <ShieldCheck className="w-4 h-4 text-indigo-600 shrink-0" /> Cơ chế tự động hóa an toàn:
+                    <ShieldCheck className="w-4 h-4 text-indigo-600 shrink-0" /> Đăng nhập bằng Chrome đang dùng:
                   </p>
                   <p className="text-indigo-800">
-                    Hệ thống sẽ mở một cửa sổ Chromium có giao diện thật với profile độc lập. Bạn tự tay nhập Email, Mật khẩu và xác thực OTP/2FA chính chủ trên điện thoại. Bot sẽ tự động trích xuất cookie và đóng cửa sổ.
+                    1. Bấm <b>Mở Chrome Đăng Nhập</b> — trang Gemini mở ra trong Chrome hiện tại của bạn (đúng profile, đúng session Google sẵn có).
+                    2. Đăng nhập Google nếu chưa, rồi <b>tắt hẳn Chrome</b> (kể cả icon dưới khay hệ thống).
+                    3. Quay lại app bấm <b>Đã Đăng Nhập Xong — Xác Nhận</b>, app sẽ tự đọc session từ profile Chrome của bạn.
+                    Không muốn tắt Chrome? Dùng extension “Gemini Gateway” → “Gửi session về app” thay cho bước 2–3.
                   </p>
                 </div>
 
@@ -1034,6 +1057,15 @@ export const AccountsPage: React.FC = () => {
                     Hủy
                   </button>
                   <button
+                    type="button"
+                    disabled={onboardStarting}
+                    onClick={(e) => handleStartBrowserOnboard(e as any, 'window')}
+                    className="px-4 py-2.5 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-xl hover:bg-indigo-100 disabled:opacity-50"
+                    title="Mở cửa sổ đăng nhập riêng của app (dự phòng khi không dùng Chrome)"
+                  >
+                    Dùng cửa sổ app
+                  </button>
+                  <button
                     type="submit"
                     disabled={onboardStarting}
                     className="px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 disabled:opacity-50 flex items-center gap-2 shadow-sm"
@@ -1046,7 +1078,7 @@ export const AccountsPage: React.FC = () => {
                     ) : (
                       <>
                         <Sparkles className="w-4 h-4 text-amber-300" />
-                        <span>Mở Cửa Sổ Đăng Nhập</span>
+                        <span>Mở Chrome Đăng Nhập</span>
                       </>
                     )}
                   </button>
@@ -1062,8 +1094,14 @@ export const AccountsPage: React.FC = () => {
                       <Check className="w-3.5 h-3.5" />
                     </div>
                     <div className="text-xs">
-                      <span className="font-semibold text-zinc-900 block">1. Khởi động Chromium Stealth</span>
-                      <span className="text-zinc-500">Loại bỏ cờ navigator.webdriver và cấu hình Proxy độc lập</span>
+                      <span className="font-semibold text-zinc-900 block">
+                        {onboardSession.mode === 'external' ? '1. Đã mở Chrome của bạn' : '1. Khởi động cửa sổ đăng nhập'}
+                      </span>
+                      <span className="text-zinc-500">
+                        {onboardSession.mode === 'external'
+                          ? 'Trang Gemini mở trong Chrome hiện tại (đúng profile của bạn)'
+                          : 'Cửa sổ riêng của app với profile độc lập'}
+                      </span>
                     </div>
                   </div>
 
@@ -1087,10 +1125,12 @@ export const AccountsPage: React.FC = () => {
                       )}
                     </div>
                     <div className="text-xs">
-                      <span className="font-semibold text-zinc-900 block">2. Đăng nhập Google & Xác thực 2FA</span>
+                      <span className="font-semibold text-zinc-900 block">2. Đăng nhập Google & Gửi session</span>
                       <span className="text-zinc-600">
                         {onboardSession.step === 'WAITING_LOGIN'
-                          ? '👉 Cửa sổ trình duyệt đang mở trên màn hình máy tính. Vui lòng đăng nhập Google!'
+                          ? onboardSession.mode === 'external'
+                            ? '👉 Trong Chrome: đăng nhập Google (nếu chưa), TẮT HẲN Chrome, rồi quay lại đây bấm “Đã Đăng Nhập Xong — Xác Nhận”. (Hoặc khỏi tắt: dùng extension → “Gửi session về app”.)'
+                            : '👉 Cửa sổ app đang mở trên màn hình. Vui lòng đăng nhập Google!'
                           : 'Đã hoàn tất xác thực đăng nhập Google'}
                       </span>
                     </div>
@@ -1163,13 +1203,25 @@ export const AccountsPage: React.FC = () => {
                       Thử Lại
                     </button>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={handleCancelBrowserOnboard}
-                      className="px-4 py-2 text-xs font-medium text-rose-600 bg-rose-50 border border-rose-200 rounded-xl hover:bg-rose-100"
-                    >
-                      Hủy Phiên & Đóng Trình Duyệt
-                    </button>
+                    <>
+                      {isDesktopBridge() && ['INITIALIZING', 'WAITING_LOGIN'].includes(onboardSession.step) && (
+                        <button
+                          type="button"
+                          onClick={handleConfirmBrowserLogin}
+                          disabled={onboardConfirming}
+                          className="px-5 py-2 text-sm font-semibold text-white bg-emerald-600 rounded-xl hover:bg-emerald-700 shadow-sm disabled:opacity-60"
+                        >
+                          {onboardConfirming ? 'Đang xác nhận...' : 'Đã Đăng Nhập Xong — Xác Nhận'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleCancelBrowserOnboard}
+                        className="px-4 py-2 text-xs font-medium text-rose-600 bg-rose-50 border border-rose-200 rounded-xl hover:bg-rose-100"
+                      >
+                        Hủy Phiên & Đóng Trình Duyệt
+                      </button>
+                    </>
                   )}
                 </div>
               </div>

@@ -14,6 +14,8 @@ import {
   extractBardError,
   parseGoogleWireResponse,
   parseGeminiQuotaResponse,
+  extractSnlm0eToken,
+  detectHandshakePageKind,
   DiscoveredModel,
   GEMINI_MODEL_HEADER_KEY,
   GEMINI_USAGE_INFO_RPC,
@@ -234,6 +236,23 @@ export async function runProtocolTests() {
 
   const proResolved = resolveGeminiModel('gemini-3.1-pro-thinking', discovered);
   assert(proResolved.modelNumber === 3, 'gemini-3.1-pro-thinking correctly resolves to gemini-3.1-pro model');
+
+  // 11. Handshake SNlM0e extraction + page-kind diagnostics
+  console.log('\n--- Suite 11: Handshake Token Extraction & Page Classification ---');
+  assert(extractSnlm0eToken('<script>"SNlM0e":"tok_plain_123"</script>') === 'tok_plain_123', 'Plain SNlM0e JSON extracted');
+  assert(extractSnlm0eToken('data:["SNlM0e","tok_array_456"]') === 'tok_array_456', 'Array-form SNlM0e extracted');
+  assert(extractSnlm0eToken('WIZ_global_data.SNlM0e = "tok_wiz_789"') === 'tok_wiz_789', 'WIZ_global_data SNlM0e extracted');
+  assert(
+    extractSnlm0eToken('AF_initDataCallback({data:[\\"SNlM0e\\":\\"tok_esc_abc\\"]});') === 'tok_esc_abc',
+    'Backslash-escaped SNlM0e extracted'
+  );
+  assert(extractSnlm0eToken('<html><body>no token here</body></html>') === null, 'Missing token returns null');
+  assert(detectHandshakePageKind('<title>Sign in - Google Accounts</title><input id="identifierId">') === 'login', 'Login page detected');
+  assert(detectHandshakePageKind('consent.google.com <p>Before you continue to Google</p>') === 'consent', 'Consent page detected');
+  assert(detectHandshakePageKind('sorry.google.com unusual traffic detected') === 'challenge', 'Challenge page detected');
+  assert(detectHandshakePageKind('account_chooser Choose an account') === 'chooser', 'Account chooser detected');
+  assert(detectHandshakePageKind('<div>SNlM0e present but unmatched</div>') === 'token-shape-changed', 'Unknown token shape flagged');
+  assert(detectHandshakePageKind('<html><body>empty app shell</body></html>') === 'unknown', 'Unknown page flagged');
 
   console.log(`\n========================================`);
   console.log(`🏁 Protocol Test Results: ${passed} Passed, ${failed} Failed`);

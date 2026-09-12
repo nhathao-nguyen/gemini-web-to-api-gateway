@@ -176,11 +176,30 @@ export class AccountManager {
     };
   }
 
+  /**
+   * Allowlisted account edits. Identity/secret/telemetry fields
+   * (id, encrypted_cookie, status, request_count, counters, timestamps)
+   * can never be mass-assigned — use the dedicated methods for those.
+   */
+  private static readonly MUTABLE_ACCOUNT_FIELDS = [
+    'name',
+    'email_label',
+    'priority',
+    'weight',
+    'supported_models',
+    'proxy_url',
+    'auth_user',
+  ] as const;
+
   public updateAccount(id: string, updates: Partial<GeminiAccount>): Omit<GeminiAccount, 'encrypted_cookie'> | undefined {
     const account = db.getAccountById(id);
     if (!account) return undefined;
 
-    const { encrypted_cookie, id: _id, ...safeUpdates } = updates as any;
+    const safeUpdates: Record<string, any> = {};
+    for (const field of AccountManager.MUTABLE_ACCOUNT_FIELDS) {
+      const value = (updates as any)[field];
+      if (value !== undefined) safeUpdates[field] = value;
+    }
     const updated = db.updateAccount(id, safeUpdates);
     if (!updated) return undefined;
 

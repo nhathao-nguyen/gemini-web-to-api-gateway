@@ -12,6 +12,28 @@ export interface CreateApiKeyDTO {
   expires_in_days?: number;
 }
 
+/**
+ * Fields a client is allowed to change. Identity/secret fields
+ * (id, key_hash, key_prefix, created_at, last_used_at) can never be mass-assigned.
+ */
+const MUTABLE_API_KEY_FIELDS = [
+  'name',
+  'enabled',
+  'allowed_models',
+  'rpm_limit',
+  'concurrent_limit',
+  'daily_request_limit',
+  'expires_at',
+] as const;
+
+export function sanitizeApiKeyUpdates(updates: Record<string, any>): Partial<ApiKey> {
+  const clean: Record<string, any> = {};
+  for (const field of MUTABLE_API_KEY_FIELDS) {
+    if (updates[field] !== undefined) clean[field] = updates[field];
+  }
+  return clean as Partial<ApiKey>;
+}
+
 export class ApiKeyManager {
   public listApiKeys(): ApiKey[] {
     return db.getApiKeys();
@@ -57,7 +79,7 @@ export class ApiKeyManager {
   }
 
   public updateApiKey(id: string, updates: Partial<ApiKey>): ApiKey | undefined {
-    return db.updateApiKey(id, updates);
+    return db.updateApiKey(id, sanitizeApiKeyUpdates(updates as Record<string, any>));
   }
 
   public deleteApiKey(id: string): boolean {

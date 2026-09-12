@@ -120,6 +120,66 @@ export function hasUsableNativeConversationState(request: ChatCompletionRequest)
 }
 
 /**
+ * Extract the SNlM0e session token from a Gemini Web HTML page. Covers plain
+ * JSON, array form, WIZ_global_data assignment, and backslash-escaped
+ * AF_initDataCallback payloads (Gemini varies the embedding).
+ */
+export function extractSnlm0eToken(html: string): string | null {
+  const patterns = [
+    /"SNlM0e":"([^"]+)"/,
+    /\["SNlM0e","([^"]+)"\]/,
+    /\["SNlM0e",\s*"([^"]+)"\]/,
+    /WIZ_global_data\.SNlM0e\s*=\s*"([^"]+)"/,
+    /\\"SNlM0e\\":\\"([^\\"]+)\\"/,
+    /\\u0022SNlM0e\\u0022:\s*\\u0022([^\\]+)\\u0022/,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m && m[1]) return m[1];
+  }
+  return null;
+}
+
+/**
+ * Classify a Gemini Web handshake HTML page when the SNlM0e session token is
+ * missing, so errors tell the user what actually happened (expired cookie vs
+ * consent page vs anti-bot challenge) instead of a generic message.
+ * Only substring markers are checked — no page content is logged or stored.
+ */
+export function detectHandshakePageKind(html: string): string {
+  if (
+    html.includes('Sign in - Google Accounts') ||
+    html.includes('identifierId') ||
+    html.includes('accounts.google.com/ServiceLogin') ||
+    html.includes('signin/v2/challenge')
+  ) {
+    return 'login';
+  }
+  if (
+    html.includes('consent.google.com') ||
+    html.includes('Before you continue to Google') ||
+    html.includes('before you continue to Google')
+  ) {
+    return 'consent';
+  }
+  if (
+    html.includes('sorry.google.com') ||
+    html.includes('/sorry/') ||
+    html.includes('unusual traffic') ||
+    html.includes('Our systems have detected unusual traffic')
+  ) {
+    return 'challenge';
+  }
+  if (html.includes('account_chooser') || html.includes('Choose an account')) {
+    return 'chooser';
+  }
+  if (html.includes('SNlM0e')) {
+    return 'token-shape-changed';
+  }
+  return 'unknown';
+}
+
+/**
  * Read response body as text with timeout and external client abort support
  */
 export async function readBodyWithTimeout(
@@ -1138,19 +1198,42 @@ export class GeminiWebProvider implements AIProvider {
       getRemainingTimeout(opDeadline, 'Session handshake HTML body'),
       signal
     );
-    const snlm0eMatch =
-      html.match(/"SNlM0e":"([^"]+)"/) ||
-      html.match(/\["SNlM0e","([^"]+)"\]/) ||
-      html.match(/WIZ_global_data\.SNlM0e\s*=\s*"([^"]+)"/);
+    const snlm0e = extractSnlm0eToken(html);
 
-    if (!snlm0eMatch || !snlm0eMatch[1]) {
-      if (html.includes('Sign in - Google Accounts') || html.includes('identifierId')) {
+    if (!snlm0e) {
+      const pageKind = detectHandshakePageKind(html);
+      // Diagnostic only: markers + sizes, never HTML/cookie content.
+      console.warn(
+        `[Upstream Gemini Web Handshake] account_id=${account.id} missing SNlM0e ` +
+          `(page=${pageKind} http=${res.status} bytes=${html.length})`
+      );
+      if (pageKind === 'login') {
         throw new Error('SESSION_EXPIRED: Google account login prompt encountered');
       }
-      throw new Error('SESSION_EXPIRED: Could not find SNlM0e token in Gemini Web page response');
+      if (pageKind === 'consent') {
+        throw new Error(
+          'SESSION_EXPIRED: Google returned a consent page instead of Gemini. ' +
+            'Mở cửa sổ đăng nhập trong app, đăng nhập Google xong bấm Xác nhận để lấy lại session.'
+        );
+      }
+      if (pageKind === 'challenge') {
+        throw new Error(
+          'SESSION_EXPIRED: Google returned an anti-bot challenge (unusual-traffic page). ' +
+            'Thử lại sau, đổi IP/proxy, hoặc đăng nhập lại trong app.'
+        );
+      }
+      if (pageKind === 'chooser') {
+        throw new Error(
+          'SESSION_EXPIRED: Google returned an account chooser page (partial session). ' +
+            'Đăng nhập lại trong app rồi bấm Xác nhận.'
+        );
+      }
+      throw new Error(
+        `SESSION_EXPIRED: Could not find SNlM0e token in Gemini Web page response (page=${pageKind}, http=${res.status}). ` +
+          'Cookie có thể đã hết hạn — đăng nhập lại trong app rồi bấm Xác nhận.'
+      );
     }
 
-    const snlm0e = snlm0eMatch[1];
     const pushMatch = html.match(/"qKIAYe":"([^"]+)"/);
     const buildMatch = html.match(/"cfb2h":"([^"]+)"/);
     const sessionMatch = html.match(/"FdrFJe":"([^"]+)"/);

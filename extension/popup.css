@@ -229,3 +229,16 @@ textarea:focus {
   border: 1px solid #d97706;
   color: #fde68a;
 }
+
+.send-group { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #334155; }
+
+.send-row { display: flex; gap: 6px; }
+
+.send-row input { width: 70px; }
+
+#pending-select, #gateway-port { background-color: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+
+#pending-select { width: 100%; }
+
+#send-msg { margin-top: 2px; }
+

@@ -94,15 +94,17 @@ export interface AccountEventItem {
 export interface SystemSettings {
   port: number;
   host: string;
+  shareLan: boolean;
+  dataDir: string;
   requestTimeout: number;
   maxUpstreamAttempts: number;
   logLevel: string;
   corsOrigins: string[];
   isProduction: boolean;
   databaseEngine: string;
+  dbPath: string;
+  gatewayUrl: string;
   isDatabaseConnected: boolean;
-  hasRedis: boolean;
-  requiresAuth: boolean;
   uptimeSeconds: number;
   nodeVersion: string;
   platform: string;

@@ -123,4 +123,100 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   await scanCookies();
+
+  // ---- Send session to desktop app via one-time capture token ----
+  const portInput = document.getElementById('gateway-port');
+  const btnLoadPending = document.getElementById('btn-load-pending');
+  const pendingSelect = document.getElementById('pending-select');
+  const btnSend = document.getElementById('btn-send');
+  const sendBtnText = document.getElementById('send-btn-text');
+  const sendMsg = document.getElementById('send-msg');
+  let pendingSessions = [];
+
+  try {
+    const stored = await chrome.storage.local.get('gatewayPort');
+    if (stored.gatewayPort) portInput.value = String(stored.gatewayPort);
+  } catch {}
+
+  function gatewayBase() {
+    const port = parseInt(portInput.value, 10) || 3000;
+    return `http://127.0.0.1:${port}`;
+  }
+
+  function setSendMsg(text, kind) {
+    sendMsg.textContent = text;
+    sendMsg.className = `notice notice-${kind || 'info'}`;
+  }
+
+  btnLoadPending.addEventListener('click', async () => {
+    const port = parseInt(portInput.value, 10) || 3000;
+    try { await chrome.storage.local.set({ gatewayPort: port }); } catch {}
+    setSendMsg('Đang tải phiên chờ từ app...', 'info');
+    btnSend.disabled = true;
+    try {
+      const res = await fetch(`${gatewayBase()}/internal/login-pending`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      pendingSessions = body.pending || [];
+      pendingSelect.innerHTML = '';
+      if (pendingSessions.length === 0) {
+        pendingSelect.innerHTML = '<option value="">— Không có phiên chờ —</option>';
+        setSendMsg('App chưa có phiên đăng nhập nào. Hãy bấm “Đăng nhập” trong app desktop trước.', 'warning');
+        return;
+      }
+      for (const p of pendingSessions) {
+        const opt = document.createElement('option');
+        opt.value = p.sessionId;
+        const minsLeft = Math.max(0, Math.round((p.expiresAt - Date.now()) / 60000));
+        opt.textContent = `${p.name}${p.emailLabel ? ` (${p.emailLabel})` : ''}${p.isReLogin ? ' [relogin]' : ''} — còn ${minsLeft}p`;
+        pendingSelect.appendChild(opt);
+      }
+      btnSend.disabled = !extractedCookieHeader;
+      setSendMsg(`Tìm thấy ${pendingSessions.length} phiên chờ. Chọn phiên rồi bấm “Gửi session về app”.`, 'info');
+    } catch (err) {
+      setSendMsg('Không kết nối được app desktop. Kiểm tra app đang mở và đúng cổng.', 'warning');
+    }
+  });
+
+  btnSend.addEventListener('click', async () => {
+    const sessionId = pendingSelect.value;
+    const pending = pendingSessions.find((p) => p.sessionId === sessionId);
+    if (!pending) {
+      setSendMsg('Hãy chọn một phiên chờ trước.', 'warning');
+      return;
+    }
+    if (!extractedCookieHeader) {
+      setSendMsg('Chưa có cookie. Hãy đăng nhập Google ở tab Gemini trước.', 'warning');
+      return;
+    }
+    // Delivery token is issued loopback-only and bound to this session.
+    btnSend.disabled = true;
+    sendBtnText.textContent = 'Đang gửi...';
+    try {
+      const tokRes = await fetch(`${gatewayBase()}/internal/login-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      });
+      const tokBody = await tokRes.json().catch(() => ({}));
+      if (!tokRes.ok || !tokBody.token) {
+        throw new Error(tokBody.error || `HTTP ${tokRes.status}`);
+      }
+      const capRes = await fetch(`${gatewayBase()}/internal/gemini-capture`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: tokBody.token, cookie: extractedCookieHeader }),
+      });
+      const capBody = await capRes.json().catch(() => ({}));
+      if (!capRes.ok || !capBody.success) {
+        throw new Error(capBody.error || `HTTP ${capRes.status}`);
+      }
+      setSendMsg(`✅ Đã gửi session “${pending.name}”. Quay lại app desktop để kiểm tra COMPLETED.`, 'info');
+      sendBtnText.textContent = 'Đã gửi ✓';
+    } catch (err) {
+      setSendMsg('Gửi thất bại: ' + err.message, 'warning');
+      sendBtnText.textContent = 'Gửi session về app';
+      btnSend.disabled = false;
+    }
+  });
 });

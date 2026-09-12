@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { checkAdminSession, loginAdmin, logoutAdmin } from '../lib/api-client.js';
+import { checkAdminSession, loginAdmin, logoutAdmin, isDesktopBridge } from '../lib/api-client.js';
 import { queryClient } from '../lib/query-client.js';
 
 export type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated';
@@ -17,6 +17,11 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [status, setStatus] = useState<AuthStatus>('loading');
 
   const checkSession = useCallback(async () => {
+    // Desktop shell is single-user local: skip login entirely.
+    if (isDesktopBridge()) {
+      setStatus('authenticated');
+      return;
+    }
     try {
       const session = await checkAdminSession();
       if (session.authenticated) {

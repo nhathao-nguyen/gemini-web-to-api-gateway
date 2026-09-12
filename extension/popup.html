@@ -62,6 +62,22 @@
         </button>
       </div>
 
+      <div class="send-group">
+        <label class="section-label" for="gateway-port">App desktop (cổng gateway):</label>
+        <div class="send-row">
+          <input id="gateway-port" type="number" min="1" max="65535" value="3000" />
+          <button id="btn-load-pending" class="btn btn-secondary">Tải phiên chờ</button>
+        </div>
+        <label class="section-label" for="pending-select">Phiên đăng nhập đang chờ:</label>
+        <select id="pending-select">
+          <option value="">— Chưa tải —</option>
+        </select>
+        <button id="btn-send" class="btn btn-primary" disabled>
+          <span id="send-btn-text">Gửi session về app</span>
+        </button>
+        <div id="send-msg" class="notice notice-info">Bấm “Tải phiên chờ” sau khi đã bấm Đăng nhập trong app desktop.</div>
+      </div>
+
       <div id="notice-msg" class="notice notice-info">
         Đăng nhập vào <strong>gemini.google.com</strong> trước khi bấm trích xuất.
       </div>

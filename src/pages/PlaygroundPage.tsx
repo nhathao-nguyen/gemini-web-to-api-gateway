@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
   Send,
@@ -147,7 +147,13 @@ export const PlaygroundPage: React.FC = () => {
   const streamReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
 
   // Queries
-  const { data: models = [], isLoading: loadingModels, refetch: refetchModels } = useQuery({
+  const {
+    data: models = [],
+    isLoading: loadingModels,
+    isError: modelsError,
+    error: modelsQueryError,
+    refetch: refetchModels,
+  } = useQuery({
     queryKey: ['models'],
     queryFn: fetchModels,
   });
@@ -344,7 +350,16 @@ export const PlaygroundPage: React.FC = () => {
     }
 
     if (!selectedModel) {
-      setErrorText('No model selected. Ensure an active Gemini session exists in the Accounts tab.');
+      if (modelsError) {
+        setErrorText(
+          `Could not load models: ${(modelsQueryError as any)?.message || 'bridge error'}. ` +
+            'Hãy mở lại app / kiểm tra log main process rồi bấm Refresh Models.'
+        );
+      } else {
+        setErrorText(
+          'No model selected. Không có account Gemini nào ở trạng thái ACTIVE — hãy sang tab Accounts đăng nhập (Browser login) rồi bấm Xác nhận, sau đó bấm Refresh Models.'
+        );
+      }
       return;
     }
 
@@ -664,9 +679,21 @@ export const PlaygroundPage: React.FC = () => {
                     </option>
                   ))}
                 </select>
+              ) : modelsError ? (
+                <div className="p-3 bg-rose-50 rounded-xl border border-rose-200 text-xs text-rose-800 leading-relaxed">
+                  Không tải được danh sách models ({(modelsQueryError as any)?.message || 'bridge error'}). Bấm{' '}
+                  <button type="button" onClick={() => refetchModels()} className="underline font-semibold">
+                    Refresh Models
+                  </button>{' '}
+                  để thử lại.
+                </div>
               ) : (
                 <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-800 leading-relaxed">
-                  No models available. Please ensure an active Gemini session is enabled.
+                  No models available. Chưa có account Gemini ACTIVE nào — sang tab{' '}
+                  <Link to="/accounts" className="underline font-semibold">
+                    Accounts
+                  </Link>{' '}
+                  để đăng nhập (Browser login → Xác nhận), rồi bấm Refresh Models.
                 </div>
               )}
 

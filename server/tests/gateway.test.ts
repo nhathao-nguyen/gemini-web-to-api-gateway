@@ -26,6 +26,16 @@ function assert(condition: boolean, testName: string, detail?: any) {
 async function runAllTests() {
   console.log('\n🧪 Running Gemini Web-to-API Gateway Test Suite...\n');
 
+  // Isolate tests from the real desktop database: re-point the shared
+  // singleton at a temp file so account selection/affinity assertions are
+  // deterministic and the production gateway.db is never touched.
+  const { db: testDb } = await import('../db/database.js');
+  const { default: os } = await import('os');
+  const { default: path } = await import('path');
+  const { default: fs } = await import('fs');
+  const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-test-'));
+  testDb.initializeSqlite(path.join(isolatedDir, 'test-gateway.db'));
+
   // 1. Encryption & Decryption Roundtrip
   console.log('--- Test Suite 1: AES-256-GCM Security & Key Hashing ---');
   const masterKey = '01234567890123456789012345678901';
@@ -350,6 +360,14 @@ async function runAllTests() {
   console.log(`\n========================================`);
   console.log(`🏁 Test Results: ${testsPassed} Passed, ${testsFailed} Failed`);
   console.log(`========================================\n`);
+
+  // Tear down the isolated database; never leave temp files behind.
+  try {
+    testDb.close();
+    fs.rmSync(isolatedDir, { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup only.
+  }
 
   if (testsFailed > 0) {
     process.exit(1);

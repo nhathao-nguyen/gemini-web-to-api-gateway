@@ -13,13 +13,22 @@ import {
   Cpu,
   RefreshCw,
 } from 'lucide-react';
-import { fetchSettings } from '../lib/api-client.js';
+import {
+  fetchSettings,
+  fetchDesktopAppConfig,
+  updateDesktopAppConfig,
+  isDesktopBridge,
+} from '../lib/api-client.js';
 import { useDocumentTitle } from '../hooks/useDocumentTitle.js';
 import { ErrorState } from '../components/ErrorState.js';
+import { useQueryClient } from '@tanstack/react-query';
 
 export const SettingsPage: React.FC = () => {
   useDocumentTitle('Settings & Guide');
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
+  const [lanSaving, setLanSaving] = useState(false);
+  const [lanNotice, setLanNotice] = useState<string | null>(null);
+  const queryClient = useQueryClient();
 
   const {
     data: settings,
@@ -33,6 +42,12 @@ export const SettingsPage: React.FC = () => {
     queryFn: fetchSettings,
   });
 
+  const { data: desktopConfig, refetch: refetchDesktopConfig } = useQuery({
+    queryKey: ['desktop-config'],
+    queryFn: fetchDesktopAppConfig,
+    enabled: isDesktopBridge(),
+  });
+
   const copy = (key: string, text: string) => {
     navigator.clipboard.writeText(text);
     setCopiedSection(key);
@@ -40,10 +55,29 @@ export const SettingsPage: React.FC = () => {
   };
 
   const currentOrigin =
-    typeof window !== 'undefined' && window.location.origin
+    typeof window !== 'undefined' && window.location.origin && window.location.origin !== 'null'
       ? window.location.origin
-      : 'http://localhost:3000';
-  const apiBaseUrl = `${currentOrigin}/v1`;
+      : settings?.gatewayUrl || 'http://localhost:3000';
+  const apiBaseUrl = `${settings?.gatewayUrl || currentOrigin}/v1`;
+
+  const handleLanToggle = async (next: boolean) => {
+    setLanSaving(true);
+    setLanNotice(null);
+    try {
+      const updated = await updateDesktopAppConfig({ shareLan: next });
+      setLanNotice(
+        updated.restartRequired
+          ? `Đã lưu. Khởi động lại app để ${next ? 'mở' : 'đóng'} chia sẻ LAN (bind ${next ? '0.0.0.0' : '127.0.0.1'}).`
+          : 'Đã lưu.'
+      );
+      refetchDesktopConfig();
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
+    } catch (err: any) {
+      setLanNotice(err.message || 'Lưu cấu hình thất bại');
+    } finally {
+      setLanSaving(false);
+    }
+  };
 
   const nodeSnippet = `import OpenAI from 'openai';
 
@@ -187,10 +221,12 @@ for chunk in response:
                 )}
               </div>
               <div className="flex justify-between py-1 border-b border-zinc-50">
-                <span className="text-zinc-500">Redis Distributed Store:</span>
-                <span className="font-mono text-zinc-900">
-                  {settings.hasRedis ? 'Enabled' : 'Disabled (Local Memory)'}
-                </span>
+                <span className="text-zinc-500">Rate Limiter:</span>
+                <span className="font-mono text-zinc-900">Local Memory (single-process)</span>
+              </div>
+              <div className="flex justify-between py-1 border-b border-zinc-50">
+                <span className="text-zinc-500">Data Directory:</span>
+                <span className="font-mono text-zinc-900 break-all text-right max-w-[60%]">{settings.dataDir}</span>
               </div>
               <div className="flex justify-between py-1">
                 <span className="text-zinc-500">Log Level:</span>
@@ -212,9 +248,7 @@ for chunk in response:
               </div>
               <div className="flex justify-between py-1 border-b border-zinc-50">
                 <span className="text-zinc-500">Admin Auth:</span>
-                <span className="font-mono text-zinc-900">
-                  {settings.requiresAuth ? 'Enforced' : 'Unlocked'}
-                </span>
+                <span className="font-mono text-zinc-900">Desktop local (no login)</span>
               </div>
               <div className="flex justify-between py-1 border-b border-zinc-50">
                 <span className="text-zinc-500">Request Timeout:</span>
@@ -228,6 +262,42 @@ for chunk in response:
           </div>
         </div>
       ) : null}
+
+      {/* LAN Sharing (desktop only) */}
+      {isDesktopBridge() && (
+        <div className="bg-white border border-zinc-200 rounded-2xl p-5 shadow-2xs space-y-3">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 pb-2 border-b border-zinc-100">
+            <span>Chia sẻ trong LAN</span>
+          </div>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <p className="text-xs text-zinc-600 leading-relaxed max-w-xl">
+              Tắt: API chỉ nghe trên máy này (127.0.0.1). Bật: các máy trong mạng LAN gọi được{' '}
+              <code className="font-mono bg-zinc-100 px-1 rounded">/v1</code> bằng API key bạn cấp ở tab API Keys.
+              Đổi chế độ cần khởi động lại app.
+            </p>
+            <button
+              type="button"
+              disabled={lanSaving}
+              onClick={() => handleLanToggle(!(desktopConfig?.shareLan ?? settings?.shareLan ?? false))}
+              className={`px-5 py-2 text-sm font-semibold rounded-xl shadow-sm disabled:opacity-60 ${
+                (desktopConfig?.shareLan ?? settings?.shareLan ?? false)
+                  ? 'text-white bg-emerald-600 hover:bg-emerald-700'
+                  : 'text-zinc-700 bg-zinc-100 hover:bg-zinc-200 border border-zinc-200'
+              }`}
+            >
+              {(desktopConfig?.shareLan ?? settings?.shareLan ?? false) ? 'Đang chia sẻ LAN — Bấm để tắt' : 'Chỉ máy này — Bấm để chia sẻ LAN'}
+            </button>
+          </div>
+          {lanNotice && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
+              {lanNotice}
+            </div>
+          )}
+          <div className="text-xs text-zinc-500">
+            Gateway URL hiện tại: <code className="font-mono bg-zinc-100 px-1 rounded select-all">{settings?.gatewayUrl || desktopConfig?.gatewayUrl}</code>
+          </div>
+        </div>
+      )}
 
       {/* Integration Guide Section */}
       <div className="space-y-6 pt-4 border-t border-zinc-200">

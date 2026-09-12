@@ -1,11 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import pg from 'pg';
 import { DatabaseSync } from 'node:sqlite';
 import { GeminiAccount, AccountStatus, ApiKey, RequestLog, AccountEvent } from '../types.js';
 import { config } from '../config.js';
-
-const { Pool } = pg;
 
 interface DatabaseData {
   accounts: GeminiAccount[];
@@ -17,17 +14,12 @@ interface DatabaseData {
 
 export class Database {
   private data: DatabaseData;
-  private pgPool: pg.Pool | null = null;
-  private isPgReady: boolean = false;
   private sqliteDb: any = null;
   private isSqliteReady: boolean = false;
-  private isProduction: boolean;
-  private initPromise: Promise<void> | null = null;
+  private retentionTimer: NodeJS.Timeout | null = null;
+  private dbPath: string;
 
-  constructor(options?: { isProduction?: boolean; databaseUrl?: string }) {
-    this.isProduction = options?.isProduction !== undefined ? options.isProduction : config.isProduction;
-    const dbUrl = options?.databaseUrl !== undefined ? options.databaseUrl : config.databaseUrl;
-
+  constructor(options?: { dbFilePath?: string }) {
     this.data = {
       accounts: [],
       api_keys: [],
@@ -39,22 +31,26 @@ export class Database {
       },
     };
 
-
-    if (dbUrl && (dbUrl.startsWith('postgresql://') || dbUrl.startsWith('postgres://'))) {
-      this.initPromise = this.initializePostgres(dbUrl);
-    } else {
-      // Default to native, local SQLite database
-      this.initializeSqlite();
-    }
+    // Desktop-local SQLite only. Path priority: explicit option > test env >
+    // configured dataDir (Electron userData) > current working directory.
+    this.dbPath =
+      options?.dbFilePath ||
+      process.env.GATEWAY_DB_PATH ||
+      path.join(config.dataDir, 'gateway.db');
+    // Local, file-backed SQLite database (single-replica desktop design).
+    this.initializeSqlite(this.dbPath);
   }
 
   public async init(): Promise<void> {
-    if (this.initPromise) {
-      await this.initPromise;
-    }
+    // Kept for boot-sequence compatibility; SQLite init is synchronous.
+  }
+
+  public getDbPath(): string {
+    return this.dbPath;
   }
 
   public close(): void {
+    this.stopRetentionScheduler();
     if (this.sqliteDb) {
       try {
         this.sqliteDb.close();
@@ -62,18 +58,23 @@ export class Database {
       } catch (err) {
         console.warn('[Database] Error closing SQLite connection:', err);
       }
-    }
-    if (this.pgPool) {
-      try {
-        this.pgPool.end();
-      } catch {}
+      this.sqliteDb = null;
+      this.isSqliteReady = false;
     }
   }
 
   public initializeSqlite(dbFilePath?: string) {
+    const dbPath = dbFilePath || this.dbPath;
     try {
-      const dbPath = dbFilePath || path.join(process.cwd(), 'gateway.db');
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
       console.log(`[Database] Initializing native SQLite database at: ${dbPath}`);
+      // Reset in-memory cache so re-pointing (tests, data-dir switch) never
+      // mixes rows from a previous database file.
+      this.data.accounts = [];
+      this.data.api_keys = [];
+      this.data.request_logs = [];
+      this.data.account_events = [];
+      this.dbPath = dbPath;
       this.sqliteDb = new DatabaseSync(dbPath);
       this.sqliteDb.exec('PRAGMA journal_mode = WAL;');
       this.sqliteDb.exec('PRAGMA foreign_keys = ON;');
@@ -147,6 +148,16 @@ export class Database {
           value TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+        CREATE INDEX IF NOT EXISTS idx_accounts_keepalive ON accounts(keepalive_status);
+        CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+        CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
+        CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_request_logs_account ON request_logs(account_id);
+        CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key_id);
+        CREATE INDEX IF NOT EXISTS idx_account_events_account ON account_events(account_id);
+        CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
       `);
 
       // SQLite column migrations
@@ -251,116 +262,48 @@ export class Database {
 
       this.isSqliteReady = true;
       console.log(
-        `[Database] SQLite ready. Loaded ${this.data.accounts.length} accounts and ${this.data.api_keys.length} API keys from gateway.db.`
+        `[Database] SQLite ready. Loaded ${this.data.accounts.length} accounts and ${this.data.api_keys.length} API keys from ${dbPath}.`
       );
     } catch (err) {
       console.error('[Database] Failed to initialize SQLite database:', err);
+      // Fail fast: running without a database would silently split-brain.
+      throw err;
     }
-  }
-
-
-  public async initializePostgres(databaseUrl: string) {
-    try {
-      this.pgPool = new Pool({
-        connectionString: databaseUrl,
-        max: 10,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 5000,
-      });
-
-      const client = await this.pgPool.connect();
-      try {
-        console.log('[Database] Connected to PostgreSQL. Initializing schema if needed...');
-        const schemaPath = path.join(process.cwd(), 'server', 'db', 'schema.sql');
-        if (fs.existsSync(schemaPath)) {
-          const sql = fs.readFileSync(schemaPath, 'utf8');
-          await client.query(sql);
-        }
-
-        // Postgres column migrations
-        await client.query(`
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_url TEXT;
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_dir TEXT;
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS user_agent TEXT;
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locale VARCHAR(32) DEFAULT 'en-US';
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) DEFAULT 'America/New_York';
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_keepalive_at TIMESTAMPTZ;
-          ALTER TABLE accounts ADD COLUMN IF NOT EXISTS keepalive_status VARCHAR(32) DEFAULT 'IDLE';
-        `);
-
-        // Load existing records from Postgres into in-memory cache
-        const accountsRes = await client.query('SELECT * FROM accounts');
-        if (accountsRes.rows.length > 0) {
-          this.data.accounts = accountsRes.rows.map((r) => ({
-            id: r.id,
-            name: r.name,
-            email_label: r.email_label,
-            encrypted_cookie: r.encrypted_cookie,
-            auth_user: r.auth_user || '0',
-            status: r.status,
-            priority: r.priority,
-            weight: r.weight,
-            supported_models: Array.isArray(r.supported_models)
-              ? r.supported_models
-              : JSON.parse(r.supported_models || '[]'),
-            proxy_url: r.proxy_url || null,
-            profile_dir: r.profile_dir || null,
-            user_agent: r.user_agent || null,
-            locale: r.locale || 'en-US',
-            timezone: r.timezone || 'America/New_York',
-            last_keepalive_at: r.last_keepalive_at ? new Date(r.last_keepalive_at).toISOString() : null,
-            keepalive_status: r.keepalive_status || 'IDLE',
-            last_success_at: r.last_success_at ? new Date(r.last_success_at).toISOString() : null,
-            last_error_at: r.last_error_at ? new Date(r.last_error_at).toISOString() : null,
-            last_error: r.last_error,
-            cooldown_until: r.cooldown_until ? new Date(r.cooldown_until).toISOString() : null,
-            consecutive_errors: r.consecutive_errors || 0,
-            request_count: parseInt(r.request_count || '0', 10),
-            created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
-            updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : new Date().toISOString(),
-          }));
-        }
-
-        const keysRes = await client.query('SELECT * FROM api_keys');
-        if (keysRes.rows.length > 0) {
-          this.data.api_keys = keysRes.rows.map((r) => ({
-            id: r.id,
-            name: r.name,
-            key_prefix: r.key_prefix,
-            key_hash: r.key_hash,
-            enabled: r.enabled,
-            allowed_models: Array.isArray(r.allowed_models)
-              ? r.allowed_models
-              : JSON.parse(r.allowed_models || '[]'),
-            rpm_limit: r.rpm_limit,
-            concurrent_limit: r.concurrent_limit,
-            daily_request_limit: r.daily_request_limit,
-            expires_at: r.expires_at ? new Date(r.expires_at).toISOString() : null,
-            created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
-            last_used_at: r.last_used_at ? new Date(r.last_used_at).toISOString() : null,
-          }));
-        }
-
-        this.isPgReady = true;
-        console.log(
-          `[Database] PostgreSQL ready. Loaded ${this.data.accounts.length} accounts and ${this.data.api_keys.length} API keys.`
-        );
-      } finally {
-        client.release();
-      }
-    } catch (err) {
-      console.warn('[Database] PostgreSQL connection failed, falling back to local SQLite:', err);
-      this.isPgReady = false;
-      this.initializeSqlite();
-    }
-  }
-
-  public isPostgresConnected(): boolean {
-    return this.isPgReady;
   }
 
   public isSqliteConnected(): boolean {
     return this.isSqliteReady;
+  }
+
+  /**
+   * Hourly retention: prune request_logs (10k rows / 14 days) and
+   * account_events (5k rows / 14 days) so the local DB cannot grow forever.
+   */
+  public startRetentionScheduler(intervalMs = 60 * 60 * 1000): void {
+    this.stopRetentionScheduler();
+    const run = () => {
+      try {
+        const { logsDeleted, eventsDeleted } = this.cleanupRetention();
+        if (logsDeleted > 0 || eventsDeleted > 0) {
+          console.log(`[Database] Retention cleanup: ${logsDeleted} logs, ${eventsDeleted} events removed.`);
+        }
+      } catch (err) {
+        console.warn('[Database] Retention cleanup failed:', (err as Error).message);
+      }
+    };
+    // Run once shortly after boot, then on interval. unref so it never
+    // keeps the process (or tests) alive by itself.
+    const initial = setTimeout(run, 60 * 1000);
+    if (typeof (initial as any).unref === 'function') (initial as any).unref();
+    this.retentionTimer = setInterval(run, intervalMs);
+    if (typeof (this.retentionTimer as any).unref === 'function') (this.retentionTimer as any).unref();
+  }
+
+  public stopRetentionScheduler(): void {
+    if (this.retentionTimer) {
+      clearInterval(this.retentionTimer);
+      this.retentionTimer = null;
+    }
   }
 
   public transaction<T>(fn: () => T): T {
@@ -589,45 +532,6 @@ export class Database {
       }
     }
 
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO accounts (
-            id, name, email_label, encrypted_cookie, auth_user, status, priority, weight, supported_models,
-            proxy_url, profile_dir, user_agent, locale, timezone, last_keepalive_at, keepalive_status,
-            last_success_at, last_error_at, last_error, cooldown_until, consecutive_errors, request_count,
-            created_at, updated_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
-          [
-            account.id,
-            account.name,
-            account.email_label,
-            account.encrypted_cookie,
-            account.auth_user,
-            account.status,
-            account.priority,
-            account.weight,
-            JSON.stringify(account.supported_models),
-            account.proxy_url || null,
-            account.profile_dir || null,
-            account.user_agent || null,
-            account.locale || 'en-US',
-            account.timezone || 'America/New_York',
-            account.last_keepalive_at || null,
-            account.keepalive_status || 'IDLE',
-            account.last_success_at || null,
-            account.last_error_at || null,
-            account.last_error || null,
-            account.cooldown_until || null,
-            account.consecutive_errors || 0,
-            account.request_count || 0,
-            account.created_at,
-            account.updated_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres insert account error:', err));
-    }
-
     return account;
   }
 
@@ -683,62 +587,6 @@ export class Database {
       }
     }
 
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `UPDATE accounts SET
-            name = $1,
-            email_label = $2,
-            encrypted_cookie = $3,
-            auth_user = $4,
-            status = $5,
-            priority = $6,
-            weight = $7,
-            supported_models = $8,
-            proxy_url = $9,
-            profile_dir = $10,
-            user_agent = $11,
-            locale = $12,
-            timezone = $13,
-            last_keepalive_at = $14,
-            keepalive_status = $15,
-            last_success_at = $16,
-            last_error_at = $17,
-            last_error = $18,
-            cooldown_until = $19,
-            consecutive_errors = $20,
-            request_count = $21,
-            updated_at = $22
-          WHERE id = $23`,
-          [
-            acc.name,
-            acc.email_label,
-            acc.encrypted_cookie,
-            acc.auth_user,
-            acc.status,
-            acc.priority,
-            acc.weight,
-            JSON.stringify(acc.supported_models),
-            acc.proxy_url || null,
-            acc.profile_dir || null,
-            acc.user_agent || null,
-            acc.locale || 'en-US',
-            acc.timezone || 'America/New_York',
-            acc.last_keepalive_at || null,
-            acc.keepalive_status || 'IDLE',
-            acc.last_success_at,
-            acc.last_error_at,
-            acc.last_error,
-            acc.cooldown_until,
-            acc.consecutive_errors,
-            acc.request_count,
-            acc.updated_at,
-            id,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres update account error:', err));
-    }
-
     return acc;
   }
 
@@ -752,9 +600,6 @@ export class Database {
         } catch (err) {
           console.error('[Database] SQLite delete account error:', err);
         }
-      }
-      if (this.isPgReady && this.pgPool) {
-        this.pgPool.query('DELETE FROM accounts WHERE id = $1', [id]).catch((err) => console.error(err));
       }
       return true;
     }
@@ -802,28 +647,6 @@ export class Database {
       }
     }
 
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO api_keys (id, name, key_prefix, key_hash, enabled, allowed_models, rpm_limit, concurrent_limit, daily_request_limit, expires_at, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-          [
-            key.id,
-            key.name,
-            key.key_prefix,
-            key.key_hash,
-            key.enabled,
-            JSON.stringify(key.allowed_models),
-            key.rpm_limit,
-            key.concurrent_limit,
-            key.daily_request_limit,
-            key.expires_at,
-            key.created_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres insert api_key error:', err));
-    }
-
     return key;
   }
 
@@ -862,34 +685,6 @@ export class Database {
       }
     }
 
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `UPDATE api_keys SET
-            name = $1,
-            enabled = $2,
-            allowed_models = $3,
-            rpm_limit = $4,
-            concurrent_limit = $5,
-            daily_request_limit = $6,
-            expires_at = $7,
-            last_used_at = $8
-          WHERE id = $9`,
-          [
-            key.name,
-            key.enabled,
-            JSON.stringify(key.allowed_models),
-            key.rpm_limit,
-            key.concurrent_limit,
-            key.daily_request_limit,
-            key.expires_at,
-            key.last_used_at,
-            id,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres update api_key error:', err));
-    }
-
     return this.data.api_keys[index];
   }
 
@@ -903,9 +698,6 @@ export class Database {
         } catch (err) {
           console.error('[Database] SQLite delete api_key error:', err);
         }
-      }
-      if (this.isPgReady && this.pgPool) {
-        this.pgPool.query('DELETE FROM api_keys WHERE id = $1', [id]).catch((err) => console.error(err));
       }
       return true;
     }
@@ -946,24 +738,6 @@ export class Database {
       }
     }
 
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO request_logs (request_id, api_key_id, account_id, model, status, latency_ms, error_code, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            log.request_id,
-            log.api_key_id,
-            log.account_id,
-            log.model,
-            log.status,
-            log.latency_ms,
-            log.error_code,
-            log.created_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres log error:', err));
-    }
   }
 
   public getRequestLogs(limit = 100): RequestLog[] {
@@ -981,11 +755,6 @@ export class Database {
       } catch (err) {
         console.error('[Database] SQLite delete request_log error:', err);
       }
-    }
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query('DELETE FROM request_logs WHERE request_id = $1', [requestId])
-        .catch((err) => console.error('[Database] Postgres delete request_log error:', err));
     }
     return true;
   }
@@ -1017,23 +786,6 @@ export class Database {
       }
     }
 
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO account_events (id, account_id, event_type, from_status, to_status, reason, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            event.id,
-            event.account_id,
-            event.event_type,
-            event.from_status,
-            event.to_status,
-            event.reason,
-            event.created_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres event error:', err));
-    }
   }
 
   public getAccountEvents(limit = 100): AccountEvent[] {

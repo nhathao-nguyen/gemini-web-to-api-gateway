@@ -39,6 +39,8 @@ import {
   startBrowserOnboarding,
   getBrowserOnboardingStatus,
   cancelBrowserOnboarding,
+  confirmBrowserLogin,
+  isDesktopBridge,
   OnboardingSessionState,
 } from '../lib/api-client.js';
 import { AccountStatus, SafeAccount } from '../types/client.js';
@@ -75,6 +77,7 @@ export const AccountDetailPage: React.FC = () => {
   // Browser re-login state
   const [onboardSession, setOnboardSession] = useState<OnboardingSessionState | null>(null);
   const [onboardStarting, setOnboardStarting] = useState(false);
+  const [onboardConfirming, setOnboardConfirming] = useState(false);
   const [onboardError, setOnboardError] = useState<string | null>(null);
   const pollerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -204,12 +207,13 @@ export const AccountDetailPage: React.FC = () => {
     }
   };
 
-  const handleStartBrowserReLogin = async () => {
+  const handleStartBrowserReLogin = async (mode: 'external' | 'window' = 'external') => {
     setOnboardStarting(true);
     setOnboardError(null);
     try {
       const session = await startBrowserOnboarding({
         accountId,
+        mode,
         proxyUrl: account?.proxy_url || undefined,
       });
       setOnboardSession(session);
@@ -866,7 +870,9 @@ export const AccountDetailPage: React.FC = () => {
             {!onboardSession ? (
               <div className="space-y-4 pt-4">
                 <p className="text-xs text-zinc-600 leading-relaxed">
-                  Cửa sổ Chromium sẽ mở ra với thư mục Profile và Proxy của tài khoản này. Bạn chỉ cần nhập mật khẩu hoặc hoàn tất xác thực 2FA. Bot sẽ tự động cập nhật cookie mới vào Database.
+                  Trang Gemini sẽ mở trong <b>Chrome đang dùng</b> của bạn. Đăng nhập nếu cần, <b>tắt hẳn Chrome</b>,
+                  rồi quay lại đây bấm <b>Đã Đăng Nhập Xong — Xác Nhận</b> để app tự đọc session mới.
+                  (Không muốn tắt Chrome? Dùng extension “Gemini Gateway” → “Gửi session về app”.)
                 </p>
 
                 {onboardError && (
@@ -884,12 +890,20 @@ export const AccountDetailPage: React.FC = () => {
                     Hủy
                   </button>
                   <button
-                    onClick={handleStartBrowserReLogin}
+                    onClick={() => handleStartBrowserReLogin('window')}
+                    disabled={onboardStarting}
+                    className="px-4 py-2 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-xl hover:bg-indigo-100 disabled:opacity-50"
+                    title="Mở cửa sổ đăng nhập riêng của app (dự phòng)"
+                  >
+                    Dùng cửa sổ app
+                  </button>
+                  <button
+                    onClick={() => handleStartBrowserReLogin('external')}
                     disabled={onboardStarting}
                     className="px-5 py-2 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 flex items-center gap-2 shadow-sm"
                   >
                     {onboardStarting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4 text-amber-300" />}
-                    <span>Mở Trình Duyệt Ngay</span>
+                    <span>Mở Chrome Ngay</span>
                   </button>
                 </div>
               </div>
@@ -924,12 +938,37 @@ export const AccountDetailPage: React.FC = () => {
                       Đóng
                     </button>
                   ) : (
-                    <button
-                      onClick={handleCancelBrowserOnboard}
-                      className="px-4 py-2 text-xs font-medium text-rose-600 bg-rose-50 border border-rose-200 rounded-xl hover:bg-rose-100"
-                    >
-                      Hủy Phiên & Đóng Cửa Sổ
-                    </button>
+                    <>
+                      {isDesktopBridge() && onboardSession && ['INITIALIZING', 'WAITING_LOGIN'].includes(onboardSession.step) && (
+                        <button
+                          onClick={async () => {
+                            setOnboardConfirming(true);
+                            try {
+                              const updated = await confirmBrowserLogin(onboardSession.sessionId);
+                              setOnboardSession(updated);
+                              if (updated.step === 'COMPLETED') {
+                                queryClient.invalidateQueries({ queryKey: ['account', accountId] });
+                                queryClient.invalidateQueries({ queryKey: ['accounts'] });
+                              }
+                            } catch (err: any) {
+                              setOnboardError(err.message || 'Xác nhận đăng nhập thất bại');
+                            } finally {
+                              setOnboardConfirming(false);
+                            }
+                          }}
+                          disabled={onboardConfirming}
+                          className="px-5 py-2 text-sm font-semibold text-white bg-emerald-600 rounded-xl hover:bg-emerald-700 disabled:opacity-60"
+                        >
+                          {onboardConfirming ? 'Đang xác nhận...' : 'Đã Đăng Nhập Xong — Xác Nhận'}
+                        </button>
+                      )}
+                      <button
+                        onClick={handleCancelBrowserOnboard}
+                        className="px-4 py-2 text-xs font-medium text-rose-600 bg-rose-50 border border-rose-200 rounded-xl hover:bg-rose-100"
+                      >
+                        Hủy Phiên & Đóng Cửa Sổ
+                      </button>
+                    </>
                   )}
                 </div>
               </div>

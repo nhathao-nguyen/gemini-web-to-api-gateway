@@ -1284,21 +1284,19 @@ export async function runRegressionTests() {
   // ----------------------------------------------------
   console.log('\n--- Req 13: Client Disconnect Standardization & Zero req.on(close) ---');
 
-  // Test 13.1: Static Source Code Scan ensures zero occurrences of req.on('close') or req.removeListener('close') in production routes
+  // Test 13.1: Static Source Code Scan ensures zero occurrences of req.on('close') or req.removeListener('close') in production routes.
+  // Desktop builds serve no admin website: server/routes/admin-routes.ts must not exist
+  // (admin operations go through Electron IPC instead).
   {
     const openaiRoutesCode = fs.readFileSync(path.join(process.cwd(), 'server', 'routes', 'openai-routes.ts'), 'utf-8');
-    const adminRoutesCode = fs.readFileSync(path.join(process.cwd(), 'server', 'routes', 'admin-routes.ts'), 'utf-8');
 
     assert(!openaiRoutesCode.includes("req.on('close'"), 'openai-routes.ts contains zero req.on(close)');
     assert(!openaiRoutesCode.includes("req.removeListener('close'"), 'openai-routes.ts contains zero req.removeListener(close)');
-    assert(!adminRoutesCode.includes("req.on('close'"), 'admin-routes.ts contains zero req.on(close)');
-    assert(!adminRoutesCode.includes("req.removeListener('close'"), 'admin-routes.ts contains zero req.removeListener(close)');
+    assert(!fs.existsSync(path.join(process.cwd(), 'server', 'routes', 'admin-routes.ts')), 'admin web routes removed (desktop uses IPC)');
 
-    // Verify all 7 routes use res.on('close', onClose)
+    // Verify /v1 routes use res.on('close', onClose)
     const openaiResCloseCount = (openaiRoutesCode.match(/res\.on\('close',\s*onClose\)/g) || []).length;
-    const adminResCloseCount = (adminRoutesCode.match(/res\.on\('close',\s*onClose\)/g) || []).length;
     assert(openaiResCloseCount === 5, `openai-routes.ts registers exactly 5 res.on('close', onClose) handlers (found ${openaiResCloseCount})`);
-    assert(adminResCloseCount === 2, `admin-routes.ts registers exactly 2 res.on('close', onClose) handlers (found ${adminResCloseCount})`);
   }
 
   // Test 13.2: Normal request completion does NOT abort
@@ -1352,18 +1350,22 @@ export async function runRegressionTests() {
     const testAcc = createDummyAccount(testAccId, 'Client Abort Penalty Check');
     db.createAccount(testAcc);
 
-    // Record client abort error
-    quotaManager.recordError(testAcc.id, new Error('CLIENT_ABORT: Client disconnected'));
+    try {
+      // Record client abort error
+      quotaManager.recordError(testAcc.id, new Error('CLIENT_ABORT: Client disconnected'));
 
-    const accAfter1 = db.getAccountById(testAcc.id);
-    assert(accAfter1?.consecutive_errors === 0, 'CLIENT_ABORT error does not increment consecutive_errors');
-    assert(accAfter1?.status === 'ACTIVE', 'CLIENT_ABORT error does not change account status to COOLDOWN');
+      const accAfter1 = db.getAccountById(testAcc.id);
+      assert(accAfter1?.consecutive_errors === 0, 'CLIENT_ABORT error does not increment consecutive_errors');
+      assert(accAfter1?.status === 'ACTIVE', 'CLIENT_ABORT error does not change account status to COOLDOWN');
 
-    // Also verify AbortError
-    quotaManager.recordError(testAcc.id, new Error('AbortError: The operation was aborted'));
-    const accAfter2 = db.getAccountById(testAcc.id);
-    assert(accAfter2?.consecutive_errors === 0, 'AbortError does not increment consecutive_errors');
-    assert(accAfter2?.status === 'ACTIVE', 'AbortError preserves ACTIVE account status');
+      // Also verify AbortError
+      quotaManager.recordError(testAcc.id, new Error('AbortError: The operation was aborted'));
+      const accAfter2 = db.getAccountById(testAcc.id);
+      assert(accAfter2?.consecutive_errors === 0, 'AbortError does not increment consecutive_errors');
+      assert(accAfter2?.status === 'ACTIVE', 'AbortError preserves ACTIVE account status');
+    } finally {
+      db.deleteAccount(testAcc.id);
+    }
   }
 
   console.log(`\n======================================================`);
