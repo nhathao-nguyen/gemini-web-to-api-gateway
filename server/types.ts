@@ -278,14 +278,16 @@ export interface AIProvider {
   ChatCompletion(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<AIProviderResult>;
   ChatCompletionStream(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): AsyncIterable<AIStreamChunk>;
-  getAccountQuota?(account: GeminiAccount): Promise<AccountQuotaInfo>;
+  getAccountQuota?(account: GeminiAccount, signal?: AbortSignal, deadline?: number): Promise<AccountQuotaInfo>;
 }
 
 

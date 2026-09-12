@@ -15,6 +15,7 @@ import { ramMediaCache } from '../services/ram-media-cache.js';
 import { db } from '../db/database.js';
 import { quotaManager } from '../services/quota-manager.js';
 import { GeminiAccount } from '../types.js';
+import { config } from '../config.js';
 
 export const openaiRouter = Router();
 
@@ -208,6 +209,15 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
   const requestId = `req_${crypto.randomBytes(8).toString('hex')}`;
   res.setHeader('x-request-id', requestId);
 
+  const operationDeadline = Date.now() + (config.requestTimeout || 60000);
+  const abortController = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
+    }
+  };
+  req.on('close', onClose);
+
   try {
     const parseResult = ImageGenerationRequestSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -215,14 +225,27 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
       return res.status(400).json(OpenAIAdapter.formatError(issues, 'invalid_payload', 'invalid_request_error'));
     }
 
-    const response = await gatewayService.handleImageGeneration(parseResult.data, apiKey, requestId);
+    const response = await gatewayService.handleImageGeneration(
+      parseResult.data,
+      apiKey,
+      requestId,
+      abortController.signal,
+      operationDeadline
+    );
     return res.json(response);
   } catch (err: any) {
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      return;
+    }
+
     const errMsg = redactString(err.message || String(err));
     let statusCode = 500;
     let errCode = 'image_generation_failed';
 
-    if (errMsg.includes('UPSTREAM_TIMEOUT')) {
+    if (errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError')) {
+      statusCode = 499;
+      errCode = 'client_abort';
+    } else if (errMsg.includes('UPSTREAM_TIMEOUT')) {
       statusCode = 504;
       errCode = 'upstream_timeout';
     } else if (errMsg.includes('MODEL_NOT_ALLOWED')) {
@@ -241,6 +264,7 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
 
     return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode, 'gateway_error'));
   } finally {
+    req.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -281,12 +305,23 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
     return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account for upload', 'no_healthy_accounts'));
   }
 
+  const operationDeadline = Date.now() + (config.requestTimeout || 60000);
+  const abortController = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
+    }
+  };
+  req.on('close', onClose);
+
   try {
     const uploaded = await geminiProvider.uploadFile(
       targetAccount,
       name || 'attachment.bin',
       mime_type || 'application/octet-stream',
-      buffer
+      buffer,
+      abortController.signal,
+      operationDeadline
     );
 
     const now = new Date();
@@ -301,8 +336,16 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
       created_at: now.toISOString(),
     });
   } catch (err: any) {
-    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'File upload failed', 'upload_failed'));
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      return;
+    }
+    const errMsg = redactString(err.message || 'File upload failed');
+    const isAbort = errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError');
+    const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
+    const errCode = isAbort ? 'client_abort' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upload_failed';
+    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode));
   } finally {
+    req.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -332,9 +375,23 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
     return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account found', 'no_healthy_accounts'));
   }
 
+  const operationDeadline = Date.now() + (config.requestTimeout || 60000);
+  const abortController = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
+    }
+  };
+  req.on('close', onClose);
+
   try {
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
-    const conversations = await geminiProvider.fetchRecentConversations(targetAccount, limit);
+    const conversations = await geminiProvider.fetchRecentConversations(
+      targetAccount,
+      limit,
+      abortController.signal,
+      operationDeadline
+    );
 
     // Register RAM affinity for discovered conversations
     for (const c of conversations) {
@@ -352,10 +409,16 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
       })),
     });
   } catch (err: any) {
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      return;
+    }
     const errMsg = redactString(err.message || 'Failed to fetch upstream conversations');
-    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
-    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error'));
+    const isAbort = errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError');
+    const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
+    const errCode = isAbort ? 'client_abort' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error';
+    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode));
   } finally {
+    req.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -407,8 +470,22 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
     return res.status(503).json(OpenAIAdapter.formatError('No active Gemini account found', 'no_healthy_accounts'));
   }
 
+  const operationDeadline = Date.now() + (config.requestTimeout || 60000);
+  const abortController = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
+    }
+  };
+  req.on('close', onClose);
+
   try {
-    const data = await geminiProvider.fetchConversationHistory(targetAccount, cid);
+    const data = await geminiProvider.fetchConversationHistory(
+      targetAccount,
+      cid,
+      abortController.signal,
+      operationDeadline
+    );
     // Refresh/set RAM affinity for this conversation
     accountScheduler.setConversationAffinity(cid, targetAccount.id);
 
@@ -420,10 +497,16 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
       last_rcid: data.lastRcid,
     });
   } catch (err: any) {
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      return;
+    }
     const errMsg = redactString(err.message || 'Failed to fetch upstream conversation turns');
-    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
-    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error'));
+    const isAbort = errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError');
+    const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
+    const errCode = isAbort ? 'client_abort' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error';
+    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode));
   } finally {
+    req.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });

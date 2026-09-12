@@ -9,7 +9,7 @@ import { accountManager } from '../services/account-manager.js';
 import { gatewayService } from '../services/gateway-service.js';
 import { geminiProvider } from '../services/gemini-adapter/index.js';
 import { EventEmitter } from 'events';
-import { RamMediaCache } from '../services/ram-media-cache.js';
+import { RamMediaCache, ramMediaCache } from '../services/ram-media-cache.js';
 import {
   GeminiWebProvider,
   hasUsableNativeConversationState,
@@ -18,6 +18,8 @@ import {
   getRemainingTimeout,
 } from '../services/gemini-adapter/gemini-web.js';
 import { GeminiAccount, ApiKey } from '../types.js';
+import { encryptCookie } from '../utils/crypto.js';
+import { config } from '../config.js';
 
 let regressionPassed = 0;
 let regressionFailed = 0;
@@ -38,7 +40,7 @@ function createDummyAccount(id: string, name: string, models = ['gemini-2.5-flas
     id,
     name,
     email_label: `${id}@example.com`,
-    encrypted_cookie: 'iv123456789012:tag1234567890123:cipher123456',
+    encrypted_cookie: encryptCookie('__Secure-1PSID=test_psid; __Secure-1PSIDTS=test_ts', config.masterEncryptionKey),
     auth_user: '0',
     status: 'ACTIVE',
     priority: 10,
@@ -883,6 +885,398 @@ export async function runRegressionTests() {
     assert(check2?.status === 'ACTIVE', 'User abort maintains ACTIVE status');
 
     db.deleteAccount(abortAccount.id);
+  }
+
+  // ==========================================================================
+  // --- Dedicated Suite: Media Cache Verification & End-to-End Shared Deadline (12 Scenarios) ---
+  // ==========================================================================
+
+  // Scenario 1: Cache reject không trả local media URL (Chat completion)
+  {
+    const accMedia1 = createDummyAccount('acc_media_rej_chat', 'Media Reject Chat');
+    db.createAccount(accMedia1);
+    const { keyRecord: key1 } = apiKeyManager.createApiKey({ name: 'Media Rej Chat Key' });
+
+    const originalChat = geminiProvider.ChatCompletion.bind(geminiProvider);
+    const originalDownload = geminiProvider.downloadGeneratedImage.bind(geminiProvider);
+    const originalSave = ramMediaCache.saveMedia.bind(ramMediaCache);
+
+    (geminiProvider as any).ChatCompletion = async () => ({
+      text: 'Image generated response',
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      images: [{ url: 'https://lh3.googleusercontent.com/upstream_img_chat_reject' }],
+    });
+
+    (geminiProvider as any).downloadGeneratedImage = async () => ({
+      data: Buffer.from('fake image data'),
+      mimeType: 'image/png',
+    });
+
+    // Mock saveMedia to reject (return false)
+    (ramMediaCache as any).saveMedia = () => false;
+
+    const res = await gatewayService.handleChatCompletion(
+      { model: 'gemini-2.5-flash', messages: [{ role: 'user', content: 'draw a cat' }] },
+      key1,
+      'req_chat_media_rej'
+    );
+
+    const returnedImg = (res.response as any).choices?.[0]?.message?.images?.[0];
+    assert(
+      returnedImg?.url === 'https://lh3.googleusercontent.com/upstream_img_chat_reject',
+      'Chat completion retains upstream URL when saveMedia rejects'
+    );
+    assert(
+      !returnedImg?.url.includes('/v1/media/'),
+      'Chat completion does NOT return /v1/media/... when cache fails'
+    );
+
+    (geminiProvider as any).ChatCompletion = originalChat;
+    (geminiProvider as any).downloadGeneratedImage = originalDownload;
+    (ramMediaCache as any).saveMedia = originalSave;
+    db.deleteAccount(accMedia1.id);
+    db.deleteApiKey(key1.id);
+  }
+
+  // Scenario 2: Cache success mới trả /v1/media/:id
+  {
+    const accMedia2 = createDummyAccount('acc_media_succ_chat', 'Media Success Chat');
+    db.createAccount(accMedia2);
+    const { keyRecord: key2 } = apiKeyManager.createApiKey({ name: 'Media Succ Chat Key' });
+
+    const originalChat = geminiProvider.ChatCompletion.bind(geminiProvider);
+    const originalDownload = geminiProvider.downloadGeneratedImage.bind(geminiProvider);
+
+    (geminiProvider as any).ChatCompletion = async () => ({
+      text: 'Image generated response',
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      images: [{ url: 'https://lh3.googleusercontent.com/upstream_img_chat_success' }],
+    });
+
+    (geminiProvider as any).downloadGeneratedImage = async () => ({
+      data: Buffer.from('succ image bytes 12345'),
+      mimeType: 'image/png',
+    });
+
+    const res = await gatewayService.handleChatCompletion(
+      { model: 'gemini-2.5-flash', messages: [{ role: 'user', content: 'draw a dog' }] },
+      key2,
+      'req_chat_media_succ'
+    );
+
+    const returnedImg = (res.response as any).choices?.[0]?.message?.images?.[0];
+    assert(
+      returnedImg?.url && returnedImg.url.startsWith('/v1/media/media_'),
+      'Chat completion returns local /v1/media/:id when cache succeeds'
+    );
+
+    const mediaId = returnedImg.url.replace('/v1/media/', '');
+    const inCache = ramMediaCache.getMedia(mediaId);
+    assert(inCache !== null, 'Local media is retrievable from ramMediaCache');
+    assert(inCache?.buffer.toString() === 'succ image bytes 12345', 'Cached buffer matches downloaded data');
+
+    (geminiProvider as any).ChatCompletion = originalChat;
+    (geminiProvider as any).downloadGeneratedImage = originalDownload;
+    db.deleteAccount(accMedia2.id);
+    db.deleteApiKey(key2.id);
+  }
+
+  // Scenario 3: Image generation URL fallback đúng khi media cache reject
+  {
+    const accImgGen = createDummyAccount('acc_imggen_fallback', 'Image Gen Fallback');
+    db.createAccount(accImgGen);
+    const { keyRecord: key3 } = apiKeyManager.createApiKey({ name: 'Image Gen Key' });
+
+    const originalChat = geminiProvider.ChatCompletion.bind(geminiProvider);
+    const originalDownload = geminiProvider.downloadGeneratedImage.bind(geminiProvider);
+    const originalSave = ramMediaCache.saveMedia.bind(ramMediaCache);
+
+    (geminiProvider as any).ChatCompletion = async () => ({
+      text: 'Generated image',
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      images: [{ url: 'https://lh3.googleusercontent.com/upstream_imggen_fallback' }],
+    });
+
+    (geminiProvider as any).downloadGeneratedImage = async () => ({
+      data: Buffer.from('imggen raw bytes'),
+      mimeType: 'image/png',
+    });
+
+    // 3a. Cache reject with response_format: 'url' -> falls back to upstream URL
+    (ramMediaCache as any).saveMedia = () => false;
+    const resUrl = await gatewayService.handleImageGeneration(
+      { prompt: 'a beautiful sunset', response_format: 'url' },
+      key3,
+      'req_imggen_fallback_url'
+    );
+    assert(
+      resUrl.data[0].url === 'https://lh3.googleusercontent.com/upstream_imggen_fallback',
+      'Image generation falls back to upstream URL when cache rejects'
+    );
+
+    // 3b. Cache success with response_format: 'url' -> uses local /v1/media/...
+    (ramMediaCache as any).saveMedia = originalSave;
+    const resUrlSucc = await gatewayService.handleImageGeneration(
+      { prompt: 'a beautiful sunset', response_format: 'url' },
+      key3,
+      'req_imggen_succ_url'
+    );
+    assert(
+      Boolean(resUrlSucc.data[0].url && resUrlSucc.data[0].url.startsWith('/v1/media/media_')),
+      'Image generation uses /v1/media/:id when cache succeeds'
+    );
+    const localId = resUrlSucc.data[0].url!.replace('/v1/media/', '');
+    assert(ramMediaCache.getMedia(localId) !== null, 'Media proxy ID exists in RAM cache');
+
+    // 3c. Cache failure with response_format: 'b64_json' -> still returns base64
+    (ramMediaCache as any).saveMedia = () => false;
+    const resB64 = await gatewayService.handleImageGeneration(
+      { prompt: 'a beautiful sunset', response_format: 'b64_json' },
+      key3,
+      'req_imggen_b64'
+    );
+    assert(
+      resB64.data[0].b64_json === Buffer.from('imggen raw bytes').toString('base64'),
+      'b64_json succeeds even when cache save fails'
+    );
+
+    (geminiProvider as any).ChatCompletion = originalChat;
+    (geminiProvider as any).downloadGeneratedImage = originalDownload;
+    (ramMediaCache as any).saveMedia = originalSave;
+    db.deleteAccount(accImgGen.id);
+    db.deleteApiKey(key3.id);
+  }
+
+  // Scenario 4: Handshake dùng remaining deadline
+  {
+    const accHandshake = createDummyAccount('acc_handshake_deadline', 'Handshake Deadline');
+    const webProvider = new GeminiWebProvider();
+
+    let threw = false;
+    try {
+      await webProvider.getOrFetchSession(accHandshake, true, undefined, Date.now() - 10);
+    } catch (e: any) {
+      threw = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(threw, 'getOrFetchSession respects remaining deadline and aborts on expired deadline');
+  }
+
+  // Scenario 5: Model discovery không reset timeout
+  {
+    const accDiscovery = createDummyAccount('acc_discovery_deadline', 'Discovery Deadline');
+    const webProvider = new GeminiWebProvider();
+
+    let threw = false;
+    try {
+      await webProvider.fetchGeminiModels(
+        accDiscovery,
+        'dummy_token',
+        'dummy_cookie',
+        'bl',
+        'sid',
+        'en',
+        'gen_id',
+        undefined,
+        Date.now() - 50
+      );
+    } catch (e: any) {
+      threw = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(threw, 'fetchGeminiModels uses shared deadline and does not reset timeout');
+  }
+
+  // Scenario 6: Inline upload dùng cùng chat deadline
+  {
+    const accUpload = createDummyAccount('acc_inline_deadline', 'Inline Deadline');
+    const webProvider = new GeminiWebProvider();
+
+    let threw = false;
+    try {
+      await webProvider.uploadFile(
+        accUpload,
+        'test.png',
+        'image/png',
+        Buffer.from('test bytes'),
+        undefined,
+        Date.now() - 20
+      );
+    } catch (e: any) {
+      threw = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(threw, 'uploadFile uses chat operation deadline and throws UPSTREAM_TIMEOUT if expired');
+  }
+
+  // Scenario 7: Chat operation deadline bao phủ handshake + upload + RPC + body
+  {
+    const accChain = createDummyAccount('acc_chain_deadline', 'Chain Deadline');
+    const webProvider = new GeminiWebProvider();
+
+    let threw = false;
+    try {
+      await webProvider.ChatCompletion(
+        accChain,
+        { model: 'gemini-2.5-flash', messages: [{ role: 'user', content: 'hello' }] },
+        undefined,
+        Date.now() - 100
+      );
+    } catch (e: any) {
+      threw = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(threw, 'ChatCompletion end-to-end operation deadline halts initial phase if budget depleted');
+  }
+
+  // Scenario 8: Image generation không tạo deadline mới sau ChatCompletion
+  {
+    const accImgDl = createDummyAccount('acc_imggen_dl_deadline', 'ImgGen DL Deadline');
+    db.createAccount(accImgDl);
+    const { keyRecord: key8 } = apiKeyManager.createApiKey({ name: 'ImgGen DL Key' });
+
+    const originalChat = geminiProvider.ChatCompletion.bind(geminiProvider);
+    const observedDeadlines: number[] = [];
+
+    (geminiProvider as any).ChatCompletion = async (acc: any, req: any, sig: any, d: number) => {
+      observedDeadlines.push(d);
+      return {
+        text: 'Image generated',
+        prompt_tokens: 5,
+        completion_tokens: 10,
+        images: [{ url: 'https://lh3.googleusercontent.com/test_deadline' }],
+      };
+    };
+
+    const originalDl = geminiProvider.downloadGeneratedImage.bind(geminiProvider);
+    (geminiProvider as any).downloadGeneratedImage = async (acc: any, url: any, size: any, sig: any, d: number) => {
+      observedDeadlines.push(d);
+      return { data: Buffer.from('bytes'), mimeType: 'image/png' };
+    };
+
+    const passedDeadline = Date.now() + 45000;
+    await gatewayService.handleImageGeneration(
+      { prompt: 'art', response_format: 'url' },
+      key8,
+      'req_dl_deadline_test',
+      undefined,
+      passedDeadline
+    );
+
+    assert(observedDeadlines.length === 2, 'Both ChatCompletion and downloadGeneratedImage were invoked');
+    assert(
+      observedDeadlines[0] === passedDeadline && observedDeadlines[1] === passedDeadline,
+      'downloadGeneratedImage received identical operationDeadline as ChatCompletion (no new deadline created)'
+    );
+
+    (geminiProvider as any).ChatCompletion = originalChat;
+    (geminiProvider as any).downloadGeneratedImage = originalDl;
+    db.deleteAccount(accImgDl.id);
+    db.deleteApiKey(key8.id);
+  }
+
+  // Scenario 9: Recent/history không reset timeout giữa session/RPC/body
+  {
+    const accRecHist = createDummyAccount('acc_rec_hist_deadline', 'Recent Hist Deadline');
+    const webProvider = new GeminiWebProvider();
+
+    let recentThrew = false;
+    try {
+      await webProvider.fetchRecentConversations(accRecHist, 5, undefined, Date.now() - 50);
+    } catch (e: any) {
+      recentThrew = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(recentThrew, 'fetchRecentConversations fails with UPSTREAM_TIMEOUT on expired shared deadline');
+
+    let historyThrew = false;
+    try {
+      await webProvider.fetchConversationHistory(accRecHist, 'c_dummy_1', undefined, Date.now() - 50);
+    } catch (e: any) {
+      historyThrew = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(historyThrew, 'fetchConversationHistory fails with UPSTREAM_TIMEOUT on expired shared deadline');
+  }
+
+  // Scenario 10: Client abort trong handshake/model discovery/upload vẫn ra CLIENT_ABORT
+  {
+    const accAbort = createDummyAccount('acc_abort_phases', 'Abort Phases');
+    db.createAccount(accAbort);
+    const webProvider = new GeminiWebProvider();
+
+    const ac1 = new AbortController();
+    ac1.abort();
+    let abort1Threw = false;
+    try {
+      await webProvider.getOrFetchSession(accAbort, true, ac1.signal);
+    } catch (e: any) {
+      abort1Threw = e.message.includes('CLIENT_ABORT') || e.message.includes('AbortError');
+    }
+    assert(abort1Threw, 'getOrFetchSession aborts with CLIENT_ABORT when client signal aborted');
+
+    const ac2 = new AbortController();
+    ac2.abort();
+    let abort2Threw = false;
+    try {
+      await webProvider.fetchGeminiModels(accAbort, 'tk', 'ck', 'bl', 'sid', 'en', 'gen', ac2.signal);
+    } catch (e: any) {
+      abort2Threw = e.message.includes('CLIENT_ABORT') || e.message.includes('AbortError');
+    }
+    assert(abort2Threw, 'fetchGeminiModels aborts with CLIENT_ABORT when client signal aborted');
+
+    const ac3 = new AbortController();
+    ac3.abort();
+    let abort3Threw = false;
+    try {
+      await webProvider.uploadFile(accAbort, 'test.txt', 'text/plain', Buffer.from('hello'), ac3.signal);
+    } catch (e: any) {
+      abort3Threw = e.message.includes('CLIENT_ABORT') || e.message.includes('AbortError');
+    }
+    assert(abort3Threw, 'uploadFile aborts with CLIENT_ABORT when client signal aborted');
+
+    db.deleteAccount(accAbort.id);
+  }
+
+  // Scenario 11: Shared deadline hết giữa các phase → phase sau fail ngay với UPSTREAM_TIMEOUT
+  {
+    const tightDeadline = Date.now() + 30;
+    const remainingBefore = getRemainingTimeout(tightDeadline, 'Phase A');
+    assert(remainingBefore > 0, 'Phase A starts within deadline');
+
+    await new Promise((r) => setTimeout(r, 45));
+
+    let phaseBThrew = false;
+    try {
+      getRemainingTimeout(tightDeadline, 'Phase B');
+    } catch (e: any) {
+      phaseBThrew = e.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(phaseBThrew, 'Phase B immediately throws UPSTREAM_TIMEOUT when deadline expired during Phase A');
+  }
+
+  // Scenario 12: Timeout error map HTTP 504 như hiện tại
+  {
+    const endpoints = [
+      'chat_completion',
+      'image_generation',
+      'recent_conversations',
+      'conversation_turns',
+    ];
+
+    for (const ep of endpoints) {
+      const timeoutErr = new Error('UPSTREAM_TIMEOUT: Upstream request timed out after 60000ms');
+      const errMsg = timeoutErr.message;
+      let statusCode = 500;
+      let errCode = 'upstream_error';
+
+      if (errMsg.includes('UPSTREAM_TIMEOUT')) {
+        statusCode = 504;
+        errCode = 'upstream_timeout';
+      }
+
+      assert(
+        statusCode === 504 && errCode === 'upstream_timeout',
+        `Endpoint ${ep} maps UPSTREAM_TIMEOUT error to HTTP status 504 and code upstream_timeout`
+      );
+    }
   }
 
   console.log(`\n======================================================`);

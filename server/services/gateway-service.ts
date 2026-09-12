@@ -142,8 +142,10 @@ export class GatewayService {
               const b64 = downloaded.data.toString('base64');
               img.b64_json = b64;
               const mediaId = `media_${crypto.randomBytes(8).toString('hex')}`;
-              ramMediaCache.saveMedia(mediaId, downloaded.data, downloaded.mimeType);
-              img.url = `/v1/media/${mediaId}`;
+              const cached = ramMediaCache.saveMedia(mediaId, downloaded.data, downloaded.mimeType);
+              if (cached) {
+                img.url = `/v1/media/${mediaId}`;
+              }
             } catch (dlErr) {
               console.warn('[Gateway] Media cache download error:', dlErr);
             }
@@ -232,9 +234,12 @@ export class GatewayService {
   public async handleImageGeneration(
     request: ImageGenerationRequest,
     apiKey: ApiKey,
-    requestId: string
+    requestId: string,
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<{ created: number; data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }> }> {
     const startTime = Date.now();
+    const operationDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
 
     let modelToUse: string;
     if (request.model) {
@@ -278,7 +283,7 @@ export class GatewayService {
         messages: [{ role: 'user', content: promptText }],
       };
 
-      const result = await geminiProvider.ChatCompletion(targetAccount, chatReq);
+      const result = await geminiProvider.ChatCompletion(targetAccount, chatReq, signal, operationDeadline);
       quotaManager.recordSuccess(targetAccount.id);
 
       if (!result.images || result.images.length === 0) {
@@ -289,19 +294,36 @@ export class GatewayService {
 
       const generatedImg = result.images[0];
       let b64: string | undefined;
-      let mediaId: string | undefined;
-      const imgDeadline = Date.now() + (config.requestTimeout || 60000);
+      let cachedMediaUrl: string | undefined;
 
       try {
-        const downloaded = await geminiProvider.downloadGeneratedImage(targetAccount, generatedImg.url, 2048, undefined, imgDeadline);
+        const downloaded = await geminiProvider.downloadGeneratedImage(
+          targetAccount,
+          generatedImg.url,
+          2048,
+          signal,
+          operationDeadline
+        );
         b64 = downloaded.data.toString('base64');
-        mediaId = `media_${crypto.randomBytes(8).toString('hex')}`;
-
-        ramMediaCache.saveMedia(mediaId, downloaded.data, downloaded.mimeType);
+        const mediaId = `media_${crypto.randomBytes(8).toString('hex')}`;
+        const cached = ramMediaCache.saveMedia(mediaId, downloaded.data, downloaded.mimeType);
+        if (cached) {
+          cachedMediaUrl = `/v1/media/${mediaId}`;
+        }
       } catch (dlErr: any) {
         console.warn(
           `[handleImageGeneration] Server-side binary download unavailable (${dlErr.message}), returning upstream media reference`
         );
+        const dlErrMsg = dlErr?.message || String(dlErr);
+        if (signal?.aborted || dlErrMsg.includes('CLIENT_ABORT') || dlErrMsg.includes('AbortError')) {
+          throw new Error('CLIENT_ABORT: Request cancelled by client');
+        }
+        if (request.response_format === 'b64_json') {
+          if (dlErrMsg.includes('UPSTREAM_TIMEOUT') || Date.now() >= operationDeadline) {
+            throw new Error(`UPSTREAM_TIMEOUT: Media download deadline exceeded for base64 image`);
+          }
+          throw new Error(`image_generation_failed: Image binary download required for b64_json format (${dlErrMsg})`);
+        }
       }
 
       usageService.logRequest({
@@ -316,14 +338,14 @@ export class GatewayService {
       });
 
       const responseItem: any = { revised_prompt: request.prompt };
-      if (request.response_format === 'url') {
-        responseItem.url = mediaId ? `/v1/media/${mediaId}` : generatedImg.url;
-      } else {
+      if (request.response_format === 'b64_json') {
         if (b64) {
           responseItem.b64_json = b64;
         } else {
-          responseItem.url = generatedImg.url;
+          throw new Error('image_generation_failed: Base64 data could not be retrieved');
         }
+      } else {
+        responseItem.url = cachedMediaUrl || generatedImg.url;
       }
 
       return {
@@ -331,15 +353,19 @@ export class GatewayService {
         data: [responseItem],
       };
     } catch (err: any) {
-      quotaManager.recordError(targetAccount.id, err);
+      const errMsg = err?.message || String(err);
+      const isClientAbort = signal?.aborted || errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError');
+      if (!isClientAbort) {
+        quotaManager.recordError(targetAccount.id, err);
+      }
       usageService.logRequest({
         request_id: requestId,
         api_key_id: apiKey.id,
         account_id: targetAccount.id,
         model: modelToUse,
-        status: 500,
+        status: isClientAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500,
         latency_ms: Date.now() - startTime,
-        error_code: 'IMAGE_GENERATION_FAILED',
+        error_code: isClientAbort ? 'CLIENT_ABORT' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'IMAGE_GENERATION_FAILED',
         created_at: new Date().toISOString(),
       });
       throw err;

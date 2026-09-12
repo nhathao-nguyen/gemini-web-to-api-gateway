@@ -493,9 +493,23 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
     return res.status(503).json({ error: 'No active Gemini account found', code: 'NO_HEALTHY_ACCOUNTS' });
   }
 
+  const operationDeadline = Date.now() + (config.requestTimeout || 60000);
+  const abortController = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
+    }
+  };
+  req.on('close', onClose);
+
   try {
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
-    const conversations = await geminiProvider.fetchRecentConversations(targetAccount, limit);
+    const conversations = await geminiProvider.fetchRecentConversations(
+      targetAccount,
+      limit,
+      abortController.signal,
+      operationDeadline
+    );
     for (const c of conversations) {
       if (c.id) {
         accountScheduler.setConversationAffinity(c.id, targetAccount.id);
@@ -510,9 +524,15 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
       })),
     });
   } catch (err: any) {
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      return;
+    }
     const errMsg = err.message || 'Failed to fetch recent conversations';
-    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
-    return res.status(statusCode).json({ error: errMsg, code: errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
+    const isAbort = errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError');
+    const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
+    return res.status(statusCode).json({ error: errMsg, code: isAbort ? 'CLIENT_ABORT' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
+  } finally {
+    req.removeListener('close', onClose);
   }
 });
 
@@ -552,8 +572,22 @@ adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: 
     return res.status(503).json({ error: 'No active Gemini account found', code: 'NO_HEALTHY_ACCOUNTS' });
   }
 
+  const operationDeadline = Date.now() + (config.requestTimeout || 60000);
+  const abortController = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
+    }
+  };
+  req.on('close', onClose);
+
   try {
-    const data = await geminiProvider.fetchConversationHistory(targetAccount, cid);
+    const data = await geminiProvider.fetchConversationHistory(
+      targetAccount,
+      cid,
+      abortController.signal,
+      operationDeadline
+    );
     // Refresh/set RAM affinity for this conversation
     accountScheduler.setConversationAffinity(cid, targetAccount.id);
     return res.json({
@@ -564,9 +598,15 @@ adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: 
       last_rcid: data.lastRcid,
     });
   } catch (err: any) {
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      return;
+    }
     const errMsg = err.message || 'Failed to fetch conversation history';
-    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
-    return res.status(statusCode).json({ error: errMsg, code: errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
+    const isAbort = errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError');
+    const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
+    return res.status(statusCode).json({ error: errMsg, code: isAbort ? 'CLIENT_ABORT' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
+  } finally {
+    req.removeListener('close', onClose);
   }
 });
 

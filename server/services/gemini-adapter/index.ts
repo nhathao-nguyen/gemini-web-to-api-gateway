@@ -10,12 +10,16 @@ export class GeminiProviderRouter implements AIProvider {
     return this.webProvider.ListModels(account);
   }
 
-  public async ValidateSession(account: GeminiAccount): Promise<HealthResult> {
-    return this.webProvider.ValidateSession(account);
+  public async ValidateSession(account: GeminiAccount, signal?: AbortSignal, deadline?: number): Promise<HealthResult> {
+    return this.webProvider.ValidateSession(account, signal, deadline);
   }
 
   public invalidateSession(accountId: string): boolean {
     return this.webProvider.invalidateSession(accountId);
+  }
+
+  public async getOrFetchSession(account: GeminiAccount, forceRefresh = false, signal?: AbortSignal, deadline?: number) {
+    return this.webProvider.getOrFetchSession(account, forceRefresh, signal, deadline);
   }
 
   public async ChatCompletion(
@@ -61,16 +65,16 @@ export class GeminiProviderRouter implements AIProvider {
     return this.webProvider.getModelCapabilities(modelId);
   }
 
-  public async getAccountQuota(account: GeminiAccount) {
-    return this.webProvider.fetchAccountQuota(account);
+  public async getAccountQuota(account: GeminiAccount, signal?: AbortSignal, deadline?: number) {
+    return this.webProvider.fetchAccountQuota(account, signal, deadline);
   }
 
-  public async fetchRecentConversations(account: GeminiAccount, limit = 10, deadline?: number) {
-    return this.webProvider.fetchRecentConversations(account, limit, deadline);
+  public async fetchRecentConversations(account: GeminiAccount, limit = 10, signal?: AbortSignal, deadline?: number) {
+    return this.webProvider.fetchRecentConversations(account, limit, signal, deadline);
   }
 
-  public async fetchConversationHistory(account: GeminiAccount, conversationId: string, deadline?: number) {
-    return this.webProvider.fetchConversationHistory(account, conversationId, deadline);
+  public async fetchConversationHistory(account: GeminiAccount, conversationId: string, signal?: AbortSignal, deadline?: number) {
+    return this.webProvider.fetchConversationHistory(account, conversationId, signal, deadline);
   }
 }
 

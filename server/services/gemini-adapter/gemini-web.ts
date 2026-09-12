@@ -1014,7 +1014,12 @@ export class GeminiWebProvider implements AIProvider {
   }
 
   private getFormattedCookie(account: GeminiAccount): string {
-    const raw = decryptCookie(account.encrypted_cookie, config.masterEncryptionKey);
+    let raw = account.encrypted_cookie || '';
+    try {
+      raw = decryptCookie(account.encrypted_cookie, config.masterEncryptionKey);
+    } catch {
+      // In tests or if already plaintext, keep raw
+    }
     let cookieHeader = cleanCookie(raw);
 
     if (cookieHeader.startsWith('{') && cookieHeader.endsWith('}')) {
@@ -1030,7 +1035,18 @@ export class GeminiWebProvider implements AIProvider {
     return deduplicateCookieString(cookieHeader);
   }
 
-  public async getOrFetchSession(account: GeminiAccount, forceRefresh = false): Promise<GeminiWebSession> {
+  public async getOrFetchSession(
+    account: GeminiAccount,
+    forceRefresh = false,
+    signal?: AbortSignal,
+    deadline?: number
+  ): Promise<GeminiWebSession> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Session handshake');
+
     const cached = this.sessionCache.get(account.id);
     const now = Date.now();
     if (!forceRefresh && cached && now - cached.fetchedAt < 30 * 60 * 1000) {
@@ -1042,25 +1058,30 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    let res = await fetchWithTimeout(targetUrl, {
-      headers: {
-        'User-Agent': BROWSER_USER_AGENT,
-        'Cookie': cookie,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-        'X-Same-Domain': '1',
-      },
-      redirect: 'manual',
-      dispatcher,
-    } as any);
+    let res = await fetchWithTimeout(
+      targetUrl,
+      {
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          'Cookie': cookie,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+          'Sec-Ch-Ua-Mobile': '?0',
+          'Sec-Ch-Ua-Platform': '"Windows"',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
+          'Upgrade-Insecure-Requests': '1',
+          'X-Same-Domain': '1',
+        },
+        redirect: 'manual',
+        dispatcher,
+      } as any,
+      getRemainingTimeout(opDeadline, 'Session handshake /app headers'),
+      signal
+    );
 
     console.log(`[Upstream Gemini Web Handshake] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/app upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -1075,25 +1096,30 @@ export class GeminiWebProvider implements AIProvider {
         account.auth_user = slotMatch[1];
         console.log(`[Upstream Gemini Web Handshake] Following account slot redirect to /u/${account.auth_user}/...`);
         const redirectUrl = location.includes('?hl=') ? location : `${location}?hl=en`;
-        res = await fetchWithTimeout(redirectUrl, {
-          headers: {
-            'User-Agent': BROWSER_USER_AGENT,
-            'Cookie': cookie,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-            'X-Same-Domain': '1',
-          },
-          redirect: 'manual',
-          dispatcher,
-        } as any);
+        res = await fetchWithTimeout(
+          redirectUrl,
+          {
+            headers: {
+              'User-Agent': BROWSER_USER_AGENT,
+              'Cookie': cookie,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+              'Sec-Ch-Ua-Mobile': '?0',
+              'Sec-Ch-Ua-Platform': '"Windows"',
+              'Sec-Fetch-Dest': 'document',
+              'Sec-Fetch-Mode': 'navigate',
+              'Sec-Fetch-Site': 'none',
+              'Sec-Fetch-User': '?1',
+              'Upgrade-Insecure-Requests': '1',
+              'X-Same-Domain': '1',
+            },
+            redirect: 'manual',
+            dispatcher,
+          } as any,
+          getRemainingTimeout(opDeadline, 'Session handshake redirect headers'),
+          signal
+        );
       }
     }
 
@@ -1107,7 +1133,11 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`UPSTREAM_ERROR: Failed to load gemini.google.com with status ${res.status}`);
     }
 
-    const html = await res.text();
+    const html = await readBodyWithTimeout(
+      res,
+      getRemainingTimeout(opDeadline, 'Session handshake HTML body'),
+      signal
+    );
     const snlm0eMatch =
       html.match(/"SNlM0e":"([^"]+)"/) ||
       html.match(/\["SNlM0e","([^"]+)"\]/) ||
@@ -1140,7 +1170,9 @@ export class GeminiWebProvider implements AIProvider {
       buildLabel,
       sessionId,
       language,
-      generationId
+      generationId,
+      signal,
+      opDeadline
     );
 
     const session: GeminiWebSession = {
@@ -1166,8 +1198,15 @@ export class GeminiWebProvider implements AIProvider {
     buildLabel: string,
     sessionId: string,
     language: string,
-    generationId: string
+    generationId: string,
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<DiscoveredModel[]> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Model discovery');
     const query = new URLSearchParams({
       rpcids: GEMINI_USER_STATUS_RPC,
       hl: language || 'en',
@@ -1196,21 +1235,26 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetchWithTimeout(targetUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': BROWSER_USER_AGENT,
-        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-        'Origin': 'https://gemini.google.com',
-        'Referer': 'https://gemini.google.com/',
-        'X-Same-Domain': '1',
-        'Cookie': cookieHeader,
-        [GEMINI_MODEL_HEADER_KEY]: JSON.stringify(batchHeader),
-        'x-goog-ext-73010989-jspb': '[0]',
-      },
-      body: form.toString(),
-      dispatcher,
-    } as any);
+    const res = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+          'Origin': 'https://gemini.google.com',
+          'Referer': 'https://gemini.google.com/',
+          'X-Same-Domain': '1',
+          'Cookie': cookieHeader,
+          [GEMINI_MODEL_HEADER_KEY]: JSON.stringify(batchHeader),
+          'x-goog-ext-73010989-jspb': '[0]',
+        },
+        body: form.toString(),
+        dispatcher,
+      } as any,
+      getRemainingTimeout(opDeadline, 'Model discovery headers'),
+      signal
+    );
 
     console.log(`[Upstream Gemini Web Discovery] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -1218,13 +1262,18 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Gemini model discovery failed with HTTP status ${res.status}`);
     }
 
-    const text = await res.text();
+    const text = await readBodyWithTimeout(
+      res,
+      getRemainingTimeout(opDeadline, 'Model discovery response body'),
+      signal
+    );
     return parseGeminiModels(text);
   }
 
-  public async ValidateSession(account: GeminiAccount): Promise<HealthResult> {
+  public async ValidateSession(account: GeminiAccount, signal?: AbortSignal, deadline?: number): Promise<HealthResult> {
     try {
-      const session = await this.getOrFetchSession(account, true);
+      const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+      const session = await this.getOrFetchSession(account, true, signal, opDeadline);
       const modelNames = session.discoveredModels.map((m) => m.id);
 
       return {
@@ -1246,8 +1295,13 @@ export class GeminiWebProvider implements AIProvider {
     }
   }
 
-  public async fetchAccountQuota(account: GeminiAccount): Promise<AccountQuotaInfo> {
-    const session = await this.getOrFetchSession(account);
+  public async fetchAccountQuota(account: GeminiAccount, signal?: AbortSignal, deadline?: number): Promise<AccountQuotaInfo> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Account quota');
+    const session = await this.getOrFetchSession(account, false, signal, opDeadline);
 
     const query = new URLSearchParams({
       rpcids: GEMINI_USAGE_INFO_RPC,
@@ -1271,19 +1325,24 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetchWithTimeout(targetUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': BROWSER_USER_AGENT,
-        'Cookie': session.cookieHeader,
-        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-        'Origin': 'https://gemini.google.com',
-        'Referer': 'https://gemini.google.com/',
-        'X-Same-Domain': '1',
-      },
-      body: form.toString(),
-      dispatcher,
-    } as any);
+    const res = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          'Cookie': session.cookieHeader,
+          'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+          'Origin': 'https://gemini.google.com',
+          'Referer': 'https://gemini.google.com/',
+          'X-Same-Domain': '1',
+        },
+        body: form.toString(),
+        dispatcher,
+      } as any,
+      getRemainingTimeout(opDeadline, 'Account quota headers'),
+      signal
+    );
 
     console.log(`[Upstream Gemini Web Quota] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -1295,7 +1354,11 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch Gemini account quota with HTTP status ${res.status}`);
     }
 
-    const text = await res.text();
+    const text = await readBodyWithTimeout(
+      res,
+      getRemainingTimeout(opDeadline, 'Account quota response body'),
+      signal
+    );
     return parseGeminiQuotaResponse(text);
   }
 
@@ -1426,7 +1489,11 @@ export class GeminiWebProvider implements AIProvider {
     deadline?: number
   ): Promise<UploadedFileRef> {
     const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
-    const session = await this.getOrFetchSession(account);
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Upload file');
+    const session = await this.getOrFetchSession(account, false, signal, opDeadline);
     const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
 
     const startHeaders: Record<string, string> = {
@@ -1520,7 +1587,11 @@ export class GeminiWebProvider implements AIProvider {
     deadline?: number
   ): Promise<{ data: Buffer; mimeType: string }> {
     const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
-    const session = await this.getOrFetchSession(account);
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Image download');
+    const session = await this.getOrFetchSession(account, false, signal, opDeadline);
     let imageUrl = rawUrl;
     if (!imageUrl.includes('=s') && !imageUrl.includes('=w')) {
       imageUrl = imageUrl.replace(/(\?|#|$)/, `=s${targetSize}$1`);
@@ -1578,7 +1649,12 @@ export class GeminiWebProvider implements AIProvider {
     signal?: AbortSignal,
     deadline?: number
   ): Promise<{ res: Response; model: DiscoveredModel; images?: GeneratedMedia[] }> {
-    const session = await this.getOrFetchSession(account);
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Execute RPC');
+    const session = await this.getOrFetchSession(account, false, signal, opDeadline);
     const resolvedModel = resolveGeminiModel(request.model, session.discoveredModels);
 
     // Pass native Gemini conversation state only when full turn metadata (cid, rid, rcid) is available
@@ -1621,9 +1697,9 @@ export class GeminiWebProvider implements AIProvider {
 
     const uploadedFilesList: UploadedFileRef[] = uploadedFiles ? [...uploadedFiles] : [];
 
-    // Upload inline attachments upstream
+    // Upload inline attachments upstream using shared opDeadline
     for (const att of attachments) {
-      const uploaded = await this.uploadFile(account, att.name, att.mimeType, att.data);
+      const uploaded = await this.uploadFile(account, att.name, att.mimeType, att.data, signal, opDeadline);
       uploadedFilesList.push(uploaded);
     }
 
@@ -1675,7 +1751,6 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
     const remaining = getRemainingTimeout(opDeadline, 'RPC headers fetch');
     const res = await fetchWithTimeout(
       rpcUrl,
@@ -1712,6 +1787,10 @@ export class GeminiWebProvider implements AIProvider {
     deadline?: number
   ): Promise<AIProviderResult> {
     const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Chat completion');
     const { res } = await this.executeRpc(account, request, signal, opDeadline);
     const remaining = getRemainingTimeout(opDeadline, 'Response body read');
     const textBody = await readBodyWithTimeout(res, remaining, signal);
@@ -1762,6 +1841,10 @@ export class GeminiWebProvider implements AIProvider {
   ): AsyncIterable<AIStreamChunk> {
     const streamStart = performance.now();
     const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Chat completion stream');
     const { res } = await this.executeRpc(account, request, signal, opDeadline);
 
     if (!res.body) {
@@ -2018,9 +2101,18 @@ export class GeminiWebProvider implements AIProvider {
     };
   }
 
-  public async fetchRecentConversations(account: GeminiAccount, limit = 10, deadline?: number): Promise<UpstreamConversation[]> {
+  public async fetchRecentConversations(
+    account: GeminiAccount,
+    limit = 10,
+    signal?: AbortSignal,
+    deadline?: number
+  ): Promise<UpstreamConversation[]> {
     const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
-    const session = await this.getOrFetchSession(account);
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Recent conversations');
+    const session = await this.getOrFetchSession(account, false, signal, opDeadline);
 
     const query = new URLSearchParams({
       rpcids: 'MaZiqc',
@@ -2046,19 +2138,24 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetchWithTimeout(targetUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': BROWSER_USER_AGENT,
-        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-        'Origin': 'https://gemini.google.com',
-        'Referer': 'https://gemini.google.com/',
-        'X-Same-Domain': '1',
-        'Cookie': session.cookieHeader,
-      },
-      body: form.toString(),
-      dispatcher,
-    } as any, getRemainingTimeout(opDeadline, 'Recent conversations headers'));
+    const res = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+          'Origin': 'https://gemini.google.com',
+          'Referer': 'https://gemini.google.com/',
+          'X-Same-Domain': '1',
+          'Cookie': session.cookieHeader,
+        },
+        body: form.toString(),
+        dispatcher,
+      } as any,
+      getRemainingTimeout(opDeadline, 'Recent conversations headers'),
+      signal
+    );
 
     console.log(`[Upstream Gemini Web ListConversations] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -2070,17 +2167,22 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch recent conversations: HTTP ${res.status}`);
     }
 
-    const text = await readBodyWithTimeout(res, getRemainingTimeout(opDeadline, 'Recent conversations body'));
+    const text = await readBodyWithTimeout(res, getRemainingTimeout(opDeadline, 'Recent conversations body'), signal);
     return parseGeminiRecentConversations(text);
   }
 
   public async fetchConversationHistory(
     account: GeminiAccount,
     conversationId: string,
+    signal?: AbortSignal,
     deadline?: number
   ): Promise<{ turns: UpstreamChatTurn[]; lastRid?: string; lastRcid?: string }> {
     const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
-    const session = await this.getOrFetchSession(account);
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    getRemainingTimeout(opDeadline, 'Conversation history');
+    const session = await this.getOrFetchSession(account, false, signal, opDeadline);
 
     const query = new URLSearchParams({
       rpcids: 'hNvQHb',
@@ -2106,19 +2208,24 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetchWithTimeout(targetUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': BROWSER_USER_AGENT,
-        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-        'Origin': 'https://gemini.google.com',
-        'Referer': 'https://gemini.google.com/',
-        'X-Same-Domain': '1',
-        'Cookie': session.cookieHeader,
-      },
-      body: form.toString(),
-      dispatcher,
-    } as any, getRemainingTimeout(opDeadline, 'Conversation history headers'));
+    const res = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+          'Origin': 'https://gemini.google.com',
+          'Referer': 'https://gemini.google.com/',
+          'X-Same-Domain': '1',
+          'Cookie': session.cookieHeader,
+        },
+        body: form.toString(),
+        dispatcher,
+      } as any,
+      getRemainingTimeout(opDeadline, 'Conversation history headers'),
+      signal
+    );
 
     console.log(`[Upstream Gemini Web ReadConversation] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -2130,7 +2237,7 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch conversation history: HTTP ${res.status}`);
     }
 
-    const text = await readBodyWithTimeout(res, getRemainingTimeout(opDeadline, 'Conversation history body'));
+    const text = await readBodyWithTimeout(res, getRemainingTimeout(opDeadline, 'Conversation history body'), signal);
     return parseGeminiConversationHistory(text);
   }
 }
