@@ -6,6 +6,8 @@ import { RateLimiter } from '../services/rate-limiter.js';
 import { AccountScheduler } from '../services/scheduler.js';
 import { QuotaManager } from '../services/quota-manager.js';
 import { ApiKeyManager } from '../services/api-key-manager.js';
+import { GatewayService } from '../services/gateway-service.js';
+import { geminiProvider } from '../services/gemini-adapter/index.js';
 import { GeminiAccount, ApiKey } from '../types.js';
 
 let testsPassed = 0;
@@ -235,10 +237,107 @@ async function runAllTests() {
 
   db.deleteApiKey('test_auth_key');
 
+  // 9. Multi-turn conversation persistence
+  console.log('\n--- Test Suite 9: Multi-turn Conversation Persistence ---');
+  const multiTurnAccount: GeminiAccount = {
+    id: 'acc_multiturn_regression',
+    name: 'Multi-turn Regression Account',
+    email_label: 'multiturn@example.com',
+    encrypted_cookie: 'enc',
+    auth_user: '0',
+    status: 'ACTIVE',
+    priority: 100,
+    weight: 10,
+    supported_models: ['gemini-3.8-flash'],
+    last_success_at: null,
+    last_error_at: null,
+    last_error: null,
+    cooldown_until: null,
+    consecutive_errors: 0,
+    request_count: 0,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  const multiTurnApiKey: ApiKey = {
+    id: 'key_multiturn_regression',
+    name: 'Multi-turn Regression Key',
+    key_prefix: 'sk-gmgw-regression',
+    key_hash: 'regression-hash',
+    enabled: true,
+    allowed_models: ['*'],
+    rpm_limit: 60,
+    concurrent_limit: 5,
+    daily_request_limit: 100,
+    expires_at: null,
+    created_at: new Date().toISOString(),
+    last_used_at: null,
+  };
+  const originalChatCompletion = geminiProvider.ChatCompletion.bind(geminiProvider);
+  const observedRequests: any[] = [];
+  db.createAccount(multiTurnAccount);
+  (geminiProvider as any).ChatCompletion = async (_account: GeminiAccount, request: any) => {
+    observedRequests.push({
+      conversation_id: request.conversation_id,
+      upstream_cid: request.upstream_cid,
+      upstream_rid: request.upstream_rid,
+      upstream_rcid: request.upstream_rcid,
+    });
+    const hasContext = Boolean(request.upstream_cid && request.upstream_rid && request.upstream_rcid);
+    return {
+      text: hasContext ? 'PHUONGHOANG2026' : 'Đã ghi nhớ từ khóa.',
+      conversation_id: 'c_multiturn_regression',
+      response_id: hasContext ? 'rid_2' : 'rid_1',
+      choice_id: hasContext ? 'rcid_2' : 'rcid_1',
+      prompt_tokens: 1,
+      completion_tokens: 1,
+    };
+  };
+
+  const testRequestPrefix = `req_multiturn_${Date.now()}`;
+  try {
+    const service = new GatewayService();
+    const firstRequest: any = {
+      model: 'gemini-3.8-flash',
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hãy ghi nhớ từ khóa bí mật: PHUONGHOANG2026' },
+      ],
+    };
+    const first = await service.handleChatCompletion(firstRequest, multiTurnApiKey, `${testRequestPrefix}_1`);
+    const conversationId = (first.response as any).conversation_id;
+    assert(conversationId === 'c_multiturn_regression', 'First response exposes upstream conversation ID');
+    assert(Boolean(conversationId && db.getConversation(conversationId)), 'First turn persists conversation locally');
+
+    const second = await service.handleChatCompletion(
+      {
+        ...firstRequest,
+        conversation_id: conversationId,
+        messages: [
+          ...firstRequest.messages,
+          { role: 'assistant', content: first.response.choices[0].message.content },
+          { role: 'user', content: 'Từ khóa bí mật tôi vừa nói là gì?' },
+        ],
+      },
+      multiTurnApiKey,
+      `${testRequestPrefix}_2`
+    );
+    assert(second.response.choices[0].message.content === 'PHUONGHOANG2026', 'Second turn keeps conversational context');
+    assert(observedRequests[1]?.upstream_cid === 'c_multiturn_regression', 'Second turn forwards inner[2] conversation ID');
+    assert(observedRequests[1]?.upstream_rid === 'rid_1', 'Second turn forwards upstream response metadata');
+    assert(observedRequests[1]?.upstream_rcid === 'rcid_1', 'Second turn forwards upstream choice metadata');
+  } finally {
+    (geminiProvider as any).ChatCompletion = originalChatCompletion;
+    db.deleteConversation('c_multiturn_regression');
+    db.deleteAccount(multiTurnAccount.id);
+    for (const log of db.getRequestLogs(1000).filter((item) => item.request_id.startsWith(testRequestPrefix))) {
+      db.deleteRequestLog(log.request_id);
+    }
+  }
+
   // Clean up test account from database so db remains completely clean
   db.deleteAccount(accountA.id);
 
-  // 9. Core Gemini Protocol Suite
+  // 10. Core Gemini Protocol Suite
   const { runProtocolTests } = await import('./gemini-protocol.test.js');
   await runProtocolTests();
 

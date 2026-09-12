@@ -458,7 +458,9 @@ adminRouter.get('/models', (req: Request, res: Response) => {
 
 // --- SYSTEM & SETTINGS ---
 adminRouter.get('/settings', (req: Request, res: Response) => {
-  const isDbConnected = db.isPostgresConnected ? db.isPostgresConnected() : true;
+  const isDbConnected = config.databaseUrl
+    ? db.isPostgresConnected()
+    : db.isSqliteConnected();
   res.json({
     port: config.port,
     host: config.host,

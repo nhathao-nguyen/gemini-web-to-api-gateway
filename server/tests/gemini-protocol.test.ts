@@ -2,6 +2,7 @@ import {
   geminiAccountUrl,
   geminiSourcePath,
   cleanCookie,
+  getDispatcherForProxy,
   mergeCookieHeaders,
   extractThinkingAndText,
   geminiAccountCapacity,
@@ -17,6 +18,7 @@ import {
   GEMINI_MODEL_HEADER_KEY,
   GEMINI_USAGE_INFO_RPC,
 } from '../services/gemini-adapter/gemini-web.js';
+import { deduplicateCookieString } from '../utils/cookie.js';
 
 let passed = 0;
 let failed = 0;
@@ -60,6 +62,11 @@ export async function runProtocolTests() {
   assert(merged.includes('__Secure-1PSID=new'), 'Merged cookies override 1PSID with fresh value');
   assert(!merged.includes('__Secure-1PSID=old'), 'Old overridden cookie does not leak in result');
   assert(merged.includes('__Secure-1PSIDTS=fresh'), 'Fresh 1PSIDTS preserved in merged header');
+  assert(
+    deduplicateCookieString('SID=old; __Secure-1PSID=new; SID=fresh') === 'SID=fresh; __Secure-1PSID=new',
+    'Cookie header deduplicates repeated names using the latest value'
+  );
+  assert(getDispatcherForProxy() === undefined, 'No-proxy requests use Node native fetch dispatcher');
 
   // 3. Thinking & Reasoning extraction
   console.log('\n--- Suite 3: Gemini Thinking / Reasoning Protocol Parsing ---');

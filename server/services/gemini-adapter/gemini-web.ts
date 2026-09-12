@@ -16,18 +16,22 @@ import {
 import { decryptCookie } from '../../utils/crypto.js';
 import { redactString } from '../../utils/redact.js';
 import { config } from '../../config.js';
+import { deduplicateCookieString } from '../../utils/cookie.js';
 
 // Configure Undici global dispatcher with generous header buffer for Gemini Web large cookie payloads
-setGlobalDispatcher(
-  new Agent({
-    maxHeaderSize: 262144, // 256 KB
-    headersTimeout: 60000,
-  })
-);
+const defaultDispatcher = new Agent({
+  maxHeaderSize: 262144, // 256 KB
+  headersTimeout: 60000,
+});
+
+setGlobalDispatcher(defaultDispatcher);
 
 const proxyAgents = new Map<string, ProxyAgent>();
 
 export function getDispatcherForProxy(proxyUrl?: string | null): Dispatcher | undefined {
+  // Let Node's native fetch use its own dispatcher when no proxy is configured.
+  // Passing an Agent created by the standalone undici package into Node's
+  // built-in fetch can fail with UND_ERR_INVALID_ARG on newer Node versions.
   if (!proxyUrl || !proxyUrl.trim()) return undefined;
   let normalized = proxyUrl.trim();
   if (!normalized.includes('://')) {
@@ -44,7 +48,6 @@ export function getDispatcherForProxy(proxyUrl?: string | null): Dispatcher | un
   }
   return agent;
 }
-
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -849,7 +852,7 @@ export class GeminiWebProvider implements AIProvider {
         // fallback
       }
     }
-    return cookieHeader;
+    return deduplicateCookieString(cookieHeader);
   }
 
   public async getOrFetchSession(account: GeminiAccount, forceRefresh = false): Promise<GeminiWebSession> {
@@ -864,7 +867,7 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
-    const res = await fetch(targetUrl, {
+    let res = await fetch(targetUrl, {
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
         'Cookie': cookie,
@@ -891,6 +894,32 @@ export class GeminiWebProvider implements AIProvider {
       if (location.includes('accounts.google.com')) {
         throw new Error('SESSION_EXPIRED: Cookie redirect to accounts.google.com login');
       }
+      // Follow redirect if redirected to a multi-login slot like /u/1/app
+      const slotMatch = location.match(/gemini\.google\.com\/u\/(\d+)\//);
+      if (slotMatch) {
+        account.auth_user = slotMatch[1];
+        console.log(`[Upstream Gemini Web Handshake] Following account slot redirect to /u/${account.auth_user}/...`);
+        const redirectUrl = location.includes('?hl=') ? location : `${location}?hl=en`;
+        res = await fetch(redirectUrl, {
+          headers: {
+            'User-Agent': BROWSER_USER_AGENT,
+            'Cookie': cookie,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+            'X-Same-Domain': '1',
+          },
+          redirect: 'manual',
+          dispatcher,
+        } as any);
+      }
     }
 
     if (!res.ok) {
@@ -904,7 +933,6 @@ export class GeminiWebProvider implements AIProvider {
     }
 
     const html = await res.text();
-
     const snlm0eMatch =
       html.match(/"SNlM0e":"([^"]+)"/) ||
       html.match(/\["SNlM0e","([^"]+)"\]/) ||

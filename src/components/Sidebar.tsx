@@ -10,6 +10,7 @@ import {
   Settings,
   ShieldCheck,
   X,
+  HeartPulse,
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { fetchAccounts } from '../lib/api-client.js';
@@ -48,6 +49,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, onCloseMobile }) =
           icon: Server,
           badge: activeAccountsCount > 0 ? `${activeAccountsCount} active` : undefined,
           isActiveMatcher: (path: string) => path.startsWith('/accounts'),
+        },
+        {
+          to: '/keepalive',
+          label: 'Keep-Alive',
+          icon: HeartPulse,
+          isActiveMatcher: (path: string) => path.startsWith('/keepalive'),
         },
         {
           to: '/api-keys',

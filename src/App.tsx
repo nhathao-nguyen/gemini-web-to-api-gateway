@@ -14,6 +14,7 @@ import { AccountDetailPage } from './pages/AccountDetailPage.js';
 import { ApiKeysPage } from './pages/ApiKeysPage.js';
 import { ApiKeyDetailPage } from './pages/ApiKeyDetailPage.js';
 import { PlaygroundPage } from './pages/PlaygroundPage.js';
+import { KeepAlivePage } from './pages/KeepAlivePage.js';
 import { LogsPage } from './pages/LogsPage.js';
 import { AuditPage } from './pages/AuditPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
@@ -27,6 +28,7 @@ export default function App() {
           <Routes>
             {/* Public Login Route */}
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/auth" element={<LoginPage />} />
 
             {/* Protected Admin Console Routes */}
             <Route element={<ProtectedLayout />}>
@@ -38,6 +40,7 @@ export default function App() {
                 <Route path="/api-keys" element={<ApiKeysPage />} />
                 <Route path="/api-keys/:keyId" element={<ApiKeyDetailPage />} />
                 <Route path="/playground" element={<PlaygroundPage />} />
+                <Route path="/keepalive" element={<KeepAlivePage />} />
                 <Route path="/logs" element={<LogsPage />} />
                 <Route path="/audit" element={<AuditPage />} />
                 <Route path="/settings" element={<SettingsPage />} />

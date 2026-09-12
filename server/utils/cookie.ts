@@ -6,6 +6,25 @@
  * 3. JSON key-value dictionary exports
  */
 
+export function deduplicateCookieString(cookieStr: string): string {
+  if (!cookieStr || typeof cookieStr !== 'string') return '';
+  const map = new Map<string, string>();
+  for (const part of cookieStr.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const name = trimmed.slice(0, eqIdx).trim();
+    let value = trimmed.slice(eqIdx + 1).trim();
+    // Strip redundant surrounding quotes if any
+    value = value.replace(/^["']|["']$/g, '');
+    if (name) {
+      map.set(name, value);
+    }
+  }
+  return Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
 export function normalizeCookieString(raw: string): string {
   if (!raw || typeof raw !== 'string') return '';
   let trimmed = raw.trim();
@@ -25,7 +44,7 @@ export function normalizeCookieString(raw: string): string {
           }
         }
         if (parts.length > 0) {
-          return parts.join('; ');
+          return deduplicateCookieString(parts.join('; '));
         }
       }
     } catch {
@@ -40,7 +59,7 @@ export function normalizeCookieString(raw: string): string {
       if (obj && typeof obj === 'object') {
         const parts = Object.entries(obj).map(([k, v]) => `${k}=${v}`);
         if (parts.length > 0) {
-          return parts.join('; ');
+          return deduplicateCookieString(parts.join('; '));
         }
       }
     } catch {
@@ -53,14 +72,17 @@ export function normalizeCookieString(raw: string): string {
     trimmed = trimmed.slice(7).trim();
   }
 
-  // Normalize multiple lines or semicolons
-  return trimmed
+  // Normalize multiple lines or semicolons, then deduplicate keys
+  const joined = trimmed
     .split(/[\r\n]+/)
     .map((line) => line.trim())
     .filter(Boolean)
     .join('; ')
     .replace(/;\s*;/g, ';');
+
+  return deduplicateCookieString(joined);
 }
+
 
 export function validateGeminiCookie(rawCookie: string): {
   valid: boolean;

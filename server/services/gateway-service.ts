@@ -4,6 +4,7 @@ import {
   ChatCompletionResponse,
   ApiKey,
   GeminiAccount,
+  AIProviderResult,
   ImageGenerationRequest,
   ModelCapabilities,
 } from '../types.js';
@@ -18,6 +19,66 @@ import { config } from '../config.js';
 import { db } from '../db/database.js';
 
 export class GatewayService {
+  private getLastUserText(request: ChatCompletionRequest): string {
+    const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user');
+    if (!lastUserMsg) return '';
+    return typeof lastUserMsg.content === 'string' ? lastUserMsg.content : JSON.stringify(lastUserMsg.content);
+  }
+
+  /**
+   * The Gemini Web API creates its c_* conversation ID on the first turn. Keep
+   * that ID in the gateway database so the next UI turn passes the ownership
+   * check and retains the same upstream rid/rcid context.
+   */
+  private persistNewConversation(
+    request: ChatCompletionRequest,
+    apiKey: ApiKey,
+    account: GeminiAccount,
+    result: Pick<AIProviderResult, 'conversation_id' | 'response_id' | 'choice_id' | 'text' | 'reasoning_content' | 'images'>
+  ): void {
+    const conversationId = result.conversation_id;
+    if (!conversationId || request.conversation_id) return;
+
+    const now = new Date().toISOString();
+    const userText = this.getLastUserText(request);
+    const conversation = db.getConversation(conversationId);
+
+    if (!conversation) {
+      db.createConversation({
+        id: conversationId,
+        title: (userText || 'New Conversation').trim().slice(0, 100),
+        model: request.model,
+        account_id: account.id,
+        upstream_cid: conversationId,
+        upstream_rid: result.response_id,
+        upstream_rcid: result.choice_id,
+        api_key_id: apiKey.id,
+        created_at: now,
+        updated_at: now,
+      });
+
+      if (userText) {
+        db.createMessage({
+          id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+          conversation_id: conversationId,
+          role: 'user',
+          content: userText,
+          created_at: now,
+        });
+      }
+
+      db.createMessage({
+        id: `msg_${crypto.randomBytes(8).toString('hex')}`,
+        conversation_id: conversationId,
+        role: 'assistant',
+        content: result.text,
+        reasoning_content: result.reasoning_content,
+        generated_media: result.images,
+        created_at: now,
+      });
+    }
+  }
+
   /**
    * List available models for this authenticated API key
    */
@@ -146,10 +207,10 @@ export class GatewayService {
         }
 
         // Save sticky conversation if conversation_id was provided or generated
-        const convId = localConv?.id || request.conversation_id || result.conversation_id;
-        if (convId) {
-          accountScheduler.setStickySession(convId, targetAccount.id);
-        }
+      const convId = localConv?.id || request.conversation_id || result.conversation_id;
+      if (convId) {
+        accountScheduler.setStickySession(convId, targetAccount.id);
+      }
 
         // Update persistent conversation record & store assistant message
         if (localConv) {
@@ -166,9 +227,11 @@ export class GatewayService {
             role: 'assistant',
             content: result.text,
             reasoning_content: result.reasoning_content,
-            generated_media: result.images,
-            created_at: new Date().toISOString(),
-          });
+          generated_media: result.images,
+          created_at: new Date().toISOString(),
+        });
+        } else {
+          this.persistNewConversation(request, apiKey, targetAccount, result);
         }
 
         const openAiResponse = OpenAIAdapter.toChatCompletionResponse(request.model, result);
@@ -522,6 +585,15 @@ export class GatewayService {
           reasoning_content: fullReasoning || undefined,
           generated_media: streamImages.length > 0 ? streamImages : undefined,
           created_at: new Date().toISOString(),
+        });
+      } else {
+        this.persistNewConversation(request, apiKey, targetAccount, {
+          conversation_id: lastConvId,
+          response_id: lastRespId,
+          choice_id: lastChoiceId,
+          text: fullText,
+          reasoning_content: fullReasoning || undefined,
+          images: streamImages.length > 0 ? streamImages : undefined,
         });
       }
 

@@ -141,6 +141,9 @@ class BrowserOnboardingService {
       });
 
       const page = context.pages()[0] || (await context.newPage());
+      try {
+        await page.bringToFront();
+      } catch {}
 
       session.step = 'WAITING_LOGIN';
       session.message = 'Cửa sổ trình duyệt đã mở! Vui lòng đăng nhập tài khoản Google và vượt qua xác thực 2FA...';
@@ -150,6 +153,10 @@ class BrowserOnboardingService {
         waitUntil: 'domcontentloaded',
         timeout: 45000,
       });
+
+      try {
+        await page.bringToFront();
+      } catch {}
 
       // Start watcher loop
       this.watchLoginProgress(session, context, page);
@@ -193,15 +200,29 @@ class BrowserOnboardingService {
 
       try {
         const currentUrl = page.url();
-        const cookies = await context.cookies();
+        const targetedCookies = await context.cookies(['https://gemini.google.com', 'https://google.com']);
 
-        const psidCookie = cookies.find((c) => c.name === '__Secure-1PSID' || c.name === 'SID');
-        const tsCookie = cookies.find((c) => c.name === '__Secure-1PSIDTS');
+        // Check essential Google authentication tokens
+        const psidCookie = targetedCookies.find((c) => c.name === '__Secure-1PSID' || c.name === 'SID');
+        const tsCookie = targetedCookies.find((c) => c.name === '__Secure-1PSIDTS');
 
         // Check if user reached Gemini main app with valid authentication cookie
         const isAppUrl = currentUrl.includes('gemini.google.com') && !currentUrl.includes('accounts.google.com');
 
-        if (psidCookie && isAppUrl) {
+        // Check DOM: make sure page has authenticated state and is not showing a Sign-In button
+        let isDomAuth = false;
+        try {
+          isDomAuth = await page.evaluate(() => {
+            const hasSignIn = !!document.querySelector('a[href*="ServiceLogin"], [data-test-id="sign-in-button"]');
+            const hasUserMenu = !!document.querySelector('a[href*="SignOutOptions"], a[aria-label*="@"], button[aria-label*="@"]');
+            const hasChatPrompt = !!document.querySelector('rich-textarea, [contenteditable="true"], textarea');
+            return !hasSignIn && (hasUserMenu || hasChatPrompt);
+          });
+        } catch {}
+
+        const isFullyAuthenticated = (psidCookie && tsCookie && isAppUrl) || (psidCookie && isAppUrl && isDomAuth);
+
+        if (isFullyAuthenticated) {
           console.log(`[Onboarding] Detected active Gemini session for ${session.accountId}! Waiting 3s for session settlement...`);
           session.step = 'EXTRACTING';
           session.message = 'Phát hiện đăng nhập thành công! Đang lưu trữ và mã hóa phiên đăng nhập...';
@@ -212,15 +233,31 @@ class BrowserOnboardingService {
           // Wait 3 seconds to let Google finish setting all tokens
           await new Promise((resolve) => setTimeout(resolve, 3000));
 
-          // Re-fetch all cookies to capture __Secure-1PSIDTS and CC
-          const settledCookies = await context.cookies();
-          const cookieHeader = settledCookies.map((c) => `${c.name}=${c.value}`).join('; ');
+          // Re-fetch targeted cookies to capture fresh tokens
+          const settledCookies = await context.cookies(['https://gemini.google.com', 'https://google.com']);
+          // Filter strictly to .google.com and gemini.google.com domains (exclude foreign/third-party domains)
+          const validCookies = settledCookies.filter(
+            (c) => c.domain === '.google.com' || c.domain === 'gemini.google.com' || c.domain === '.gemini.google.com'
+          );
+
+          // Deduplicate by name, preferring gemini.google.com over .google.com
+          const cookieMap = new Map<string, string>();
+          for (const c of validCookies) {
+            if (!cookieMap.has(c.name) || c.domain.includes('gemini')) {
+              cookieMap.set(c.name, c.value);
+            }
+          }
+          const cookieHeader = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
           const normalized = normalizeCookieString(cookieHeader);
+
+          // Detect auth_user slot dynamically from URL (e.g. /u/1/)
+          const finalUrl = page.url();
+          const authUserMatch = finalUrl.match(/gemini\.google\.com\/u\/(\d+)\//);
+          const detectedAuthUser = authUserMatch ? authUserMatch[1] : '0';
 
           // Attempt to extract user email or display name if available
           let detectedEmail = session.emailLabel;
           try {
-            const pageTitle = await page.title();
             const accountBtnText = await page.evaluate(() => {
               // Try to find Google Account button text or aria-label
               const btn = document.querySelector('a[aria-label*="@"], button[aria-label*="@"], a[href*="SignOutOptions"]');
@@ -250,6 +287,7 @@ class BrowserOnboardingService {
             const existing = db.getAccountById(session.accountId);
             db.updateAccount(session.accountId, {
               encrypted_cookie: encryptedCookie,
+              auth_user: detectedAuthUser,
               status: 'ACTIVE',
               email_label: detectedEmail || existing?.email_label || '',
               proxy_url: session.proxyUrl,
@@ -278,7 +316,7 @@ class BrowserOnboardingService {
               name: session.name,
               email_label: detectedEmail,
               encrypted_cookie: encryptedCookie,
-              auth_user: '0',
+              auth_user: detectedAuthUser,
               status: 'ACTIVE',
               priority: session.priority,
               weight: session.weight,
@@ -286,6 +324,7 @@ class BrowserOnboardingService {
               proxy_url: session.proxyUrl,
               profile_dir: profileDir,
               user_agent: DEFAULT_USER_AGENT,
+
               locale: 'en-US',
               timezone: 'America/New_York',
               last_keepalive_at: nowStr,

@@ -25,6 +25,7 @@ import {
   MessageSquare,
   History,
   Plus,
+  Square,
 } from 'lucide-react';
 import {
   fetchModels,
@@ -146,6 +147,9 @@ export const PlaygroundPage: React.FC = () => {
   // Streaming temp output
   const [streamingText, setStreamingText] = useState('');
   const [streamingReasoning, setStreamingReasoning] = useState('');
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const streamReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
 
   // Queries
   const { data: models = [], isLoading: loadingModels, refetch: refetchModels } = useQuery({
@@ -224,6 +228,17 @@ export const PlaygroundPage: React.FC = () => {
     } catch {}
   }, [turns]);
 
+  // Keep the latest assistant output in view while streaming and settle into
+  // the newest turn after a completed response.
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: isLoading ? 'auto' : 'smooth',
+    });
+  }, [turns, streamingText, streamingReasoning, isLoading, errorText]);
+
   // Persist key
   const handleKeyChange = (val: string) => {
     setManualKey(val);
@@ -297,6 +312,12 @@ export const PlaygroundPage: React.FC = () => {
   };
 
   const clearChat = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      streamReaderRef.current?.cancel().catch(() => {});
+      abortControllerRef.current = null;
+      streamReaderRef.current = null;
+    }
     setTurns([]);
     setStreamingText('');
     setStreamingReasoning('');
@@ -316,9 +337,14 @@ export const PlaygroundPage: React.FC = () => {
     } catch {}
   };
 
+  const stopGeneration = () => {
+    abortControllerRef.current?.abort();
+    streamReaderRef.current?.cancel().catch(() => {});
+  };
+
   const handleSendRequest = async (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!prompt.trim() && attachments.length === 0) || isLoading) return;
+    if ((!prompt.trim() && attachments.length === 0) || isLoading || abortControllerRef.current) return;
 
     if (!manualKey.trim()) {
       setErrorText('Please enter a valid Gateway API key (sk-gmgw-...) to authenticate requests.');
@@ -351,6 +377,9 @@ export const PlaygroundPage: React.FC = () => {
     setStreamingReasoning('');
     setErrorText(null);
     setLatencyMs(null);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     const startTime = Date.now();
 
     try {
@@ -416,6 +445,7 @@ export const PlaygroundPage: React.FC = () => {
           Authorization: `Bearer ${manualKey.trim()}`,
         },
         body: JSON.stringify(requestPayload),
+        signal: controller.signal,
       });
 
       if (!res.ok) {
@@ -426,6 +456,8 @@ export const PlaygroundPage: React.FC = () => {
       if (stream) {
         if (!res.body) throw new Error('No stream body returned');
         const reader = res.body.getReader();
+        activeReader = reader;
+        streamReaderRef.current = reader;
         const decoder = new TextDecoder();
         let buffer = '';
         let accumulatedText = '';
@@ -541,8 +573,22 @@ export const PlaygroundPage: React.FC = () => {
         ]);
       }
     } catch (err: any) {
-      setErrorText(err.message || 'Error occurred while communicating with Gateway');
+      if (controller.signal.aborted || err?.name === 'AbortError') {
+        setStreamingText('');
+        setStreamingReasoning('');
+      } else {
+        setErrorText(err.message || 'Error occurred while communicating with Gateway');
+      }
     } finally {
+      if (activeReader) {
+        activeReader.releaseLock();
+      }
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+      if (streamReaderRef.current === activeReader) {
+        streamReaderRef.current = null;
+      }
       setIsLoading(false);
       setUploadNotice(null);
     }
@@ -929,7 +975,7 @@ export const PlaygroundPage: React.FC = () => {
           )}
 
           {/* Messages Container */}
-          <div className="flex-1 p-5 overflow-y-auto space-y-4 max-h-[520px]">
+          <div ref={messagesContainerRef} className="flex-1 p-5 overflow-y-auto space-y-4 max-h-[520px]">
             {showRaw ? (
               <pre className="p-4 bg-zinc-50 border border-zinc-200 rounded-xl text-xs font-mono text-zinc-800 whitespace-pre-wrap">
                 {JSON.stringify(rawResponse || { turns }, null, 2)}
@@ -1141,11 +1187,16 @@ export const PlaygroundPage: React.FC = () => {
                   className="flex-1 px-3 py-2 border border-zinc-200 rounded-xl text-sm focus:ring-2 focus:ring-zinc-900 focus:outline-none bg-zinc-50 focus:bg-white resize-none"
                 />
                 <button
-                  type="submit"
-                  disabled={isLoading || (!prompt.trim() && attachments.length === 0) || models.length === 0}
-                  className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-sm font-medium hover:bg-zinc-800 transition-colors shadow-xs disabled:opacity-50 shrink-0 self-end"
+                  type={isLoading ? 'button' : 'submit'}
+                  onClick={isLoading ? stopGeneration : undefined}
+                  disabled={!isLoading && ((!prompt.trim() && attachments.length === 0) || models.length === 0)}
+                  aria-label={isLoading ? 'Stop generation' : 'Send message'}
+                  title={isLoading ? 'Stop generation' : 'Send message'}
+                  className={`px-4 py-2 text-white rounded-xl text-sm font-medium transition-colors shadow-xs disabled:opacity-50 shrink-0 self-end ${
+                    isLoading ? 'bg-rose-600 hover:bg-rose-700' : 'bg-zinc-900 hover:bg-zinc-800'
+                  }`}
                 >
-                  {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                  {isLoading ? <Square className="w-4 h-4 fill-current" /> : <Send className="w-4 h-4" />}
                 </button>
               </div>
             </form>

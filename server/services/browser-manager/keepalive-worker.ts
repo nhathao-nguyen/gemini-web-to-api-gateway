@@ -186,19 +186,21 @@ export class KeepAliveWorker {
         timezone: account.timezone || 'America/New_York',
       });
 
-      // Pre-seed context with account's stored cookies if available
+      // Reuse the persistent profile's current session whenever possible. A
+      // stored cookie snapshot can be older than the profile and blindly
+      // injecting it may create Google's CookieMismatch page.
+      let storedCookieList: any[] = [];
       if (account.encrypted_cookie) {
         try {
           const raw = decryptCookie(account.encrypted_cookie, config.masterEncryptionKey);
           const pairs = raw.split(';').map((p) => p.trim()).filter(Boolean);
-          const cookieList: any[] = [];
           for (const pair of pairs) {
             const eqIdx = pair.indexOf('=');
             if (eqIdx > 0) {
               const name = pair.slice(0, eqIdx).trim();
               const value = pair.slice(eqIdx + 1).trim();
               if (name && value) {
-                cookieList.push({
+                storedCookieList.push({
                   name,
                   value,
                   url: 'https://gemini.google.com',
@@ -206,26 +208,48 @@ export class KeepAliveWorker {
               }
             }
           }
-          if (cookieList.length > 0) {
-            await context.addCookies(cookieList);
-          }
         } catch (seedErr) {
-          console.warn('[KeepAliveWorker] Could not pre-seed cookies from database:', seedErr);
+          console.warn('[KeepAliveWorker] Could not decode stored cookies:', seedErr);
         }
+      }
+
+      const existingProfileCookies = await context.cookies(['https://gemini.google.com', 'https://google.com']);
+      const hasExistingAuthCookie = existingProfileCookies.some(
+        (cookie: any) => cookie.name === '__Secure-1PSID' || cookie.name === 'SID'
+      );
+      if (storedCookieList.length > 0 && !hasExistingAuthCookie) {
+        await context.addCookies(storedCookieList);
+      } else if (hasExistingAuthCookie) {
+        console.log(`[KeepAliveWorker] Reusing authenticated persistent profile for ${account.name}.`);
       }
 
       const page = await context.newPage();
 
       // 2. Navigate to Gemini Web app
       const targetUrl = geminiAccountUrl('https://gemini.google.com/app', account.auth_user);
-      const response = await page.goto(targetUrl, {
+      let response = await page.goto(targetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 45000,
       });
 
+      const isGoogleLoginUrl = (url: string) =>
+        url.includes('accounts.google.com/v3/signin') || url.includes('accounts.google.com/ServiceLogin');
+
+      // If the persistent profile is stale, retry once with the encrypted
+      // snapshot before classifying the account as expired.
+      let finalUrl = page.url();
+      if (isGoogleLoginUrl(finalUrl) && hasExistingAuthCookie && storedCookieList.length > 0) {
+        await context.clearCookies();
+        await context.addCookies(storedCookieList);
+        response = await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        });
+        finalUrl = page.url();
+      }
+
       // 3. Check for auth redirect
-      const finalUrl = page.url();
-      if (finalUrl.includes('accounts.google.com/v3/signin') || finalUrl.includes('accounts.google.com/ServiceLogin')) {
+      if (isGoogleLoginUrl(finalUrl)) {
         console.warn(`[KeepAliveWorker] Account ${account.name} session has expired (Redirected to Google Login).`);
         db.updateAccount(accountId, {
           status: 'SESSION_EXPIRED',
@@ -249,25 +273,80 @@ export class KeepAliveWorker {
         return { success: false, message: 'Google session expired; account status set to SESSION_EXPIRED.' };
       }
 
+      // A stale PSID cookie can still exist on Google's anonymous landing page.
+      // Do not persist cookies unless the page exposes the authenticated Gemini
+      // surface and no sign-in control is present.
+      const hasAuthenticatedGeminiSurface = async () => {
+        try {
+          await page.waitForSelector('rich-textarea, [contenteditable="true"], textarea', { timeout: 10000 });
+          return await page.evaluate(() => {
+            const hasSignIn = Boolean(
+              document.querySelector(
+                'a[href*="ServiceLogin"], a[href*="/signin"], [aria-label="Sign in"], [data-test-id="sign-in-button"]'
+              )
+            );
+            const hasChatSurface = Boolean(document.querySelector('rich-textarea, [contenteditable="true"], textarea'));
+            const hasUserMenu = Boolean(
+              document.querySelector('a[href*="SignOutOptions"], a[aria-label*="@"], button[aria-label*="@"]')
+            );
+            return !hasSignIn && (hasChatSurface || hasUserMenu);
+          });
+        } catch {
+          return false;
+        }
+      };
+
+      let isAuthenticatedPage = await hasAuthenticatedGeminiSurface();
+      if (!isAuthenticatedPage && hasExistingAuthCookie && storedCookieList.length > 0) {
+        await context.clearCookies();
+        await context.addCookies(storedCookieList);
+        response = await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        });
+        finalUrl = page.url();
+        if (isGoogleLoginUrl(finalUrl)) {
+          throw new Error('SESSION_EXPIRED: Gemini redirected to Google login after cookie recovery');
+        }
+        isAuthenticatedPage = await hasAuthenticatedGeminiSurface();
+      }
+
+      if (!isAuthenticatedPage) {
+        throw new Error('SESSION_EXPIRED: Gemini page did not expose an authenticated chat surface');
+      }
+
       // 4. Simulate subtle activity & wait 4-5s for Google to refresh __Secure-1PSIDTS
       const jitterMs = 3500 + Math.floor(Math.random() * 1500);
       await new Promise((r) => setTimeout(r, jitterMs));
 
-      // 5. Extract latest cookies from browser context
-      const cookies = await context.cookies();
-      const psid = cookies.find((c: any) => c.name === '__Secure-1PSID');
-      const psidts = cookies.find((c: any) => c.name === '__Secure-1PSIDTS');
+      // 5. Extract latest cookies from browser context (targeted Google/Gemini domains only)
+      const targetedCookies = await context.cookies(['https://gemini.google.com', 'https://google.com']);
+      const validCookies = targetedCookies.filter((c: any) => {
+        const domain = String(c.domain || '').replace(/^\./, '').toLowerCase();
+        return domain === 'google.com' || domain === 'gemini.google.com';
+      });
+
+      const psid = validCookies.find((c: any) => c.name === '__Secure-1PSID');
+      const psidts = validCookies.find((c: any) => c.name === '__Secure-1PSIDTS');
 
       if (!psid) {
         throw new Error('__Secure-1PSID cookie not found in context after navigation');
       }
 
-      const cookieHeader = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+      const cookieMap = new Map<string, string>();
+      for (const c of validCookies) {
+        if (!cookieMap.has(c.name) || c.domain.includes('gemini')) {
+          cookieMap.set(c.name, c.value);
+        }
+      }
+      const cookieHeader = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
       const normalized = normalizeCookieString(cookieHeader);
       const encryptedCookie = encryptCookie(normalized, config.masterEncryptionKey);
       const nowStr = new Date().toISOString();
 
+
       db.updateAccount(accountId, {
+        status: account.status === 'SESSION_EXPIRED' ? 'ACTIVE' : account.status,
         encrypted_cookie: encryptedCookie,
         last_keepalive_at: nowStr,
         keepalive_status: 'SUCCESS',
@@ -297,8 +376,10 @@ export class KeepAliveWorker {
     } catch (err: any) {
       console.error(`[KeepAliveWorker] Failed keep-alive for ${account.name}:`, err.message);
       const nowStr = new Date().toISOString();
+      const isSessionExpired = String(err.message || '').includes('SESSION_EXPIRED');
 
       db.updateAccount(accountId, {
+        ...(isSessionExpired ? { status: 'SESSION_EXPIRED' as const } : {}),
         keepalive_status: 'FAILED',
         last_error: `Keep-alive error: ${err.message}`,
         last_error_at: nowStr,
@@ -309,7 +390,7 @@ export class KeepAliveWorker {
         account_id: accountId,
         event_type: 'KEEPALIVE_FAILED',
         from_status: account.status,
-        to_status: account.status,
+        to_status: isSessionExpired ? 'SESSION_EXPIRED' : account.status,
         reason: `Keep-alive error: ${err.message}`,
         created_at: nowStr,
       });

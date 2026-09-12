@@ -274,6 +274,21 @@ export class Database {
         }));
       }
 
+      const eventRows = this.sqliteDb
+        .prepare('SELECT * FROM account_events ORDER BY created_at DESC LIMIT 500')
+        .all();
+      if (eventRows && eventRows.length > 0) {
+        this.data.account_events = eventRows.map((e: any) => ({
+          id: e.id,
+          account_id: e.account_id,
+          event_type: e.event_type,
+          from_status: e.from_status || null,
+          to_status: e.to_status,
+          reason: e.reason,
+          created_at: e.created_at,
+        }));
+      }
+
       const convRows = this.sqliteDb.prepare('SELECT * FROM conversations ORDER BY updated_at DESC').all();
       if (convRows && convRows.length > 0) {
         this.data.conversations = convRows.map((c: any) => ({
@@ -425,6 +440,10 @@ export class Database {
 
   public isPostgresConnected(): boolean {
     return this.isPgReady;
+  }
+
+  public isSqliteConnected(): boolean {
+    return this.isSqliteReady;
   }
 
   // --- ACCOUNTS ---
@@ -855,6 +874,26 @@ export class Database {
 
   public getRequestLogs(limit = 100): RequestLog[] {
     return this.data.request_logs.slice(0, limit);
+  }
+
+  public deleteRequestLog(requestId: string): boolean {
+    const index = this.data.request_logs.findIndex((log) => log.request_id === requestId);
+    if (index === -1) return false;
+
+    this.data.request_logs.splice(index, 1);
+    if (this.isSqliteReady && this.sqliteDb) {
+      try {
+        this.sqliteDb.prepare('DELETE FROM request_logs WHERE request_id = ?').run(requestId);
+      } catch (err) {
+        console.error('[Database] SQLite delete request_log error:', err);
+      }
+    }
+    if (this.isPgReady && this.pgPool) {
+      this.pgPool
+        .query('DELETE FROM request_logs WHERE request_id = $1', [requestId])
+        .catch((err) => console.error('[Database] Postgres delete request_log error:', err));
+    }
+    return true;
   }
 
   public addAccountEvent(event: AccountEvent) {

@@ -107,19 +107,30 @@ export async function launchStealthContext(options: LaunchStealthOptions): Promi
 
   const proxyConfig = parseProxy(options.proxyUrl);
 
+  const isHeaded = options.headless === false;
+
   const launchOptions: any = {
-    headless: options.headless !== undefined ? options.headless : true,
+    headless: !isHeaded,
     proxy: proxyConfig,
     userAgent: options.userAgent || DEFAULT_USER_AGENT,
     locale: options.locale || 'en-US',
     timezoneId: options.timezone || 'America/New_York',
-    viewport: { width: 1280, height: 800 },
+    viewport: isHeaded ? null : { width: 1280, height: 800 },
     ignoreHTTPSErrors: false,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--disable-infobars',
       '--disable-dev-shm-usage',
-      '--window-size=1280,800',
+      ...(isHeaded
+        ? [
+            '--new-window',
+            '--start-maximized',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-notifications',
+            '--window-position=50,50',
+          ]
+        : ['--window-size=1280,800']),
     ],
   };
 
