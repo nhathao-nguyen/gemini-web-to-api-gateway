@@ -496,11 +496,11 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
   const operationDeadline = Date.now() + (config.requestTimeout || 60000);
   const abortController = new AbortController();
   const onClose = () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
@@ -532,7 +532,7 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
     const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
     return res.status(statusCode).json({ error: errMsg, code: isAbort ? 'CLIENT_ABORT' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
   } finally {
-    req.removeListener('close', onClose);
+    res.removeListener('close', onClose);
   }
 });
 
@@ -575,11 +575,11 @@ adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: 
   const operationDeadline = Date.now() + (config.requestTimeout || 60000);
   const abortController = new AbortController();
   const onClose = () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const data = await geminiProvider.fetchConversationHistory(
@@ -606,7 +606,7 @@ adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: 
     const statusCode = isAbort ? 499 : errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
     return res.status(statusCode).json({ error: errMsg, code: isAbort ? 'CLIENT_ABORT' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
   } finally {
-    req.removeListener('close', onClose);
+    res.removeListener('close', onClose);
   }
 });
 

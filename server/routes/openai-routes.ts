@@ -83,7 +83,7 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
   const abortController = new AbortController();
   const onClose = () => {
     if (!res.writableEnded && !abortController.signal.aborted) {
-      abortController.abort();
+      abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
   res.on('close', onClose);
@@ -212,11 +212,11 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
   const operationDeadline = Date.now() + (config.requestTimeout || 60000);
   const abortController = new AbortController();
   const onClose = () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const parseResult = ImageGenerationRequestSchema.safeParse(req.body);
@@ -264,7 +264,7 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
 
     return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode, 'gateway_error'));
   } finally {
-    req.removeListener('close', onClose);
+    res.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -308,11 +308,11 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
   const operationDeadline = Date.now() + (config.requestTimeout || 60000);
   const abortController = new AbortController();
   const onClose = () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const uploaded = await geminiProvider.uploadFile(
@@ -345,7 +345,7 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
     const errCode = isAbort ? 'client_abort' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upload_failed';
     return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode));
   } finally {
-    req.removeListener('close', onClose);
+    res.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -378,11 +378,11 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
   const operationDeadline = Date.now() + (config.requestTimeout || 60000);
   const abortController = new AbortController();
   const onClose = () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
@@ -418,7 +418,7 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
     const errCode = isAbort ? 'client_abort' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error';
     return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode));
   } finally {
-    req.removeListener('close', onClose);
+    res.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -473,11 +473,11 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
   const operationDeadline = Date.now() + (config.requestTimeout || 60000);
   const abortController = new AbortController();
   const onClose = () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort(new Error('CLIENT_ABORT: Client disconnected'));
     }
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const data = await geminiProvider.fetchConversationHistory(
@@ -506,7 +506,7 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
     const errCode = isAbort ? 'client_abort' : errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error';
     return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode));
   } finally {
-    req.removeListener('close', onClose);
+    res.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });

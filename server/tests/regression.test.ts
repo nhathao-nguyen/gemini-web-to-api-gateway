@@ -1279,6 +1279,93 @@ export async function runRegressionTests() {
     }
   }
 
+  // ----------------------------------------------------
+  // Requirement 13: Client Disconnect Standardization (req.on('close') Regression Elimination)
+  // ----------------------------------------------------
+  console.log('\n--- Req 13: Client Disconnect Standardization & Zero req.on(close) ---');
+
+  // Test 13.1: Static Source Code Scan ensures zero occurrences of req.on('close') or req.removeListener('close') in production routes
+  {
+    const openaiRoutesCode = fs.readFileSync(path.join(process.cwd(), 'server', 'routes', 'openai-routes.ts'), 'utf-8');
+    const adminRoutesCode = fs.readFileSync(path.join(process.cwd(), 'server', 'routes', 'admin-routes.ts'), 'utf-8');
+
+    assert(!openaiRoutesCode.includes("req.on('close'"), 'openai-routes.ts contains zero req.on(close)');
+    assert(!openaiRoutesCode.includes("req.removeListener('close'"), 'openai-routes.ts contains zero req.removeListener(close)');
+    assert(!adminRoutesCode.includes("req.on('close'"), 'admin-routes.ts contains zero req.on(close)');
+    assert(!adminRoutesCode.includes("req.removeListener('close'"), 'admin-routes.ts contains zero req.removeListener(close)');
+
+    // Verify all 7 routes use res.on('close', onClose)
+    const openaiResCloseCount = (openaiRoutesCode.match(/res\.on\('close',\s*onClose\)/g) || []).length;
+    const adminResCloseCount = (adminRoutesCode.match(/res\.on\('close',\s*onClose\)/g) || []).length;
+    assert(openaiResCloseCount === 5, `openai-routes.ts registers exactly 5 res.on('close', onClose) handlers (found ${openaiResCloseCount})`);
+    assert(adminResCloseCount === 2, `admin-routes.ts registers exactly 2 res.on('close', onClose) handlers (found ${adminResCloseCount})`);
+  }
+
+  // Test 13.2: Normal request completion does NOT abort
+  {
+    const abortCtrl = new AbortController();
+    const mockReq = new EventEmitter();
+    const mockRes = new EventEmitter() as any;
+    mockRes.writableEnded = false;
+
+    const onClose = () => {
+      if (!mockRes.writableEnded && !abortCtrl.signal.aborted) {
+        abortCtrl.abort(new Error('CLIENT_ABORT: Client disconnected'));
+      }
+    };
+    mockRes.on('close', onClose);
+
+    // Incoming request body completes upload (emits 'close' on req)
+    mockReq.emit('close');
+    assert(!abortCtrl.signal.aborted, 'Normal incoming request stream close on req does NOT abort upstream controller');
+
+    // Normal response completes successfully
+    mockRes.writableEnded = true;
+    mockRes.emit('close');
+    mockRes.removeListener('close', onClose);
+    assert(!abortCtrl.signal.aborted, 'Normal response finish with writableEnded=true does NOT abort upstream controller');
+  }
+
+  // Test 13.3: Premature client disconnect DOES abort with CLIENT_ABORT
+  {
+    const abortCtrl = new AbortController();
+    const mockRes = new EventEmitter() as any;
+    mockRes.writableEnded = false;
+
+    const onClose = () => {
+      if (!mockRes.writableEnded && !abortCtrl.signal.aborted) {
+        abortCtrl.abort(new Error('CLIENT_ABORT: Client disconnected'));
+      }
+    };
+    mockRes.on('close', onClose);
+
+    // Client drops TCP connection prematurely
+    mockRes.emit('close');
+    assert(abortCtrl.signal.aborted, 'Premature client response close aborts upstream AbortController');
+    const reasonMsg = (abortCtrl.signal.reason as Error)?.message || String(abortCtrl.signal.reason);
+    assert(reasonMsg.includes('CLIENT_ABORT'), 'AbortController reason contains CLIENT_ABORT message');
+  }
+
+  // Test 13.4: Client abort does NOT penalize Gemini account or increment consecutive_errors
+  {
+    const testAccId = `acc_client_abort_${crypto.randomBytes(4).toString('hex')}`;
+    const testAcc = createDummyAccount(testAccId, 'Client Abort Penalty Check');
+    db.createAccount(testAcc);
+
+    // Record client abort error
+    quotaManager.recordError(testAcc.id, new Error('CLIENT_ABORT: Client disconnected'));
+
+    const accAfter1 = db.getAccountById(testAcc.id);
+    assert(accAfter1?.consecutive_errors === 0, 'CLIENT_ABORT error does not increment consecutive_errors');
+    assert(accAfter1?.status === 'ACTIVE', 'CLIENT_ABORT error does not change account status to COOLDOWN');
+
+    // Also verify AbortError
+    quotaManager.recordError(testAcc.id, new Error('AbortError: The operation was aborted'));
+    const accAfter2 = db.getAccountById(testAcc.id);
+    assert(accAfter2?.consecutive_errors === 0, 'AbortError does not increment consecutive_errors');
+    assert(accAfter2?.status === 'ACTIVE', 'AbortError preserves ACTIVE account status');
+  }
+
   console.log(`\n======================================================`);
   console.log(`🏁 Regression Results: ${regressionPassed} Passed, ${regressionFailed} Failed`);
   console.log(`======================================================\n`);
