@@ -1,5 +1,7 @@
 import { AIProvider, GeminiAccount, ChatCompletionRequest, AIProviderResult, AIStreamChunk, HealthResult } from '../../types.js';
-import { GeminiWebProvider } from './gemini-web.js';
+import { GeminiWebProvider, hasUsableNativeConversationState } from './gemini-web.js';
+
+export { hasUsableNativeConversationState };
 
 export class GeminiProviderRouter implements AIProvider {
   private webProvider = new GeminiWebProvider();
@@ -45,9 +47,10 @@ export class GeminiProviderRouter implements AIProvider {
   public async downloadGeneratedImage(
     account: GeminiAccount,
     rawUrl: string,
-    targetSize?: number
+    targetSize?: number,
+    signal?: AbortSignal
   ) {
-    return this.webProvider.downloadGeneratedImage(account, rawUrl, targetSize);
+    return this.webProvider.downloadGeneratedImage(account, rawUrl, targetSize, signal);
   }
 
   public getModelCapabilities(modelId: string) {

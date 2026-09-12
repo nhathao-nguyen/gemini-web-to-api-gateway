@@ -3,7 +3,7 @@ import { validateGeminiCookie, normalizeCookieString } from '../utils/cookie.js'
 import { redactString, redactObject } from '../utils/redact.js';
 import { OpenAIAdapter } from '../services/openai-adapter.js';
 import { RateLimiter } from '../services/rate-limiter.js';
-import { AccountScheduler } from '../services/scheduler.js';
+import { AccountScheduler, accountScheduler } from '../services/scheduler.js';
 import { QuotaManager } from '../services/quota-manager.js';
 import { ApiKeyManager } from '../services/api-key-manager.js';
 import { GatewayService } from '../services/gateway-service.js';
@@ -306,12 +306,15 @@ async function runAllTests() {
     const first = await service.handleChatCompletion(firstRequest, multiTurnApiKey, `${testRequestPrefix}_1`);
     const conversationId = (first.response as any).conversation_id;
     assert(conversationId === 'c_multiturn_regression', 'First response exposes upstream conversation ID');
-    assert(Boolean(conversationId && db.getConversation(conversationId)), 'First turn persists conversation locally');
+    assert(accountScheduler.getConversationAffinity(conversationId) === multiTurnAccount.id, 'First turn sets conversation affinity in RAM');
 
     const second = await service.handleChatCompletion(
       {
         ...firstRequest,
         conversation_id: conversationId,
+        upstream_cid: conversationId,
+        upstream_rid: (first.response as any).response_id,
+        upstream_rcid: (first.response as any).choice_id,
         messages: [
           ...firstRequest.messages,
           { role: 'assistant', content: first.response.choices[0].message.content },
@@ -327,7 +330,6 @@ async function runAllTests() {
     assert(observedRequests[1]?.upstream_rcid === 'rcid_1', 'Second turn forwards upstream choice metadata');
   } finally {
     (geminiProvider as any).ChatCompletion = originalChatCompletion;
-    db.deleteConversation('c_multiturn_regression');
     db.deleteAccount(multiTurnAccount.id);
     for (const log of db.getRequestLogs(1000).filter((item) => item.request_id.startsWith(testRequestPrefix))) {
       db.deleteRequestLog(log.request_id);

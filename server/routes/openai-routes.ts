@@ -9,9 +9,9 @@ import {
   ImageGenerationRequestSchema,
 } from '../services/openai-adapter.js';
 import { redactString } from '../utils/redact.js';
-import { db } from '../db/database.js';
 import { accountScheduler } from '../services/scheduler.js';
 import { geminiProvider } from '../services/gemini-adapter/index.js';
+import { ramMediaCache } from '../services/ram-media-cache.js';
 
 export const openaiRouter = Router();
 
@@ -55,6 +55,19 @@ openaiRouter.get('/models', authMiddleware, async (req: Request, res: Response) 
 });
 
 /**
+ * GET /v1/models/capabilities
+ */
+openaiRouter.get('/models/capabilities', authMiddleware, async (req: Request, res: Response) => {
+  const apiKey = (req as any).gatewayApiKey;
+  try {
+    const capabilities = gatewayService.getCapabilities(apiKey);
+    return res.json({ object: 'capabilities', data: capabilities });
+  } finally {
+    await rateLimiter.release(apiKey.id);
+  }
+});
+
+/**
  * POST /v1/chat/completions
  */
 openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res: Response) => {
@@ -62,10 +75,10 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
   const requestId = `req_${crypto.randomBytes(8).toString('hex')}`;
   res.setHeader('x-request-id', requestId);
 
-  // Setup abort controller on client disconnect
+  // Client disconnect / abort handler
   const abortController = new AbortController();
   const onDisconnect = () => {
-    if (!res.writableEnded) {
+    if (!abortController.signal.aborted) {
       abortController.abort();
     }
   };
@@ -80,16 +93,6 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
     }
 
     const payload = parseResult.data as unknown as import('../types.js').ChatCompletionRequest;
-
-    // Validate conversation ownership if conversation_id is provided
-    if (payload.conversation_id) {
-      const conv = db.getConversation(payload.conversation_id);
-      if (!conv || conv.api_key_id !== apiKey.id) {
-        return res
-          .status(404)
-          .json(OpenAIAdapter.formatError('Conversation not found', 'conversation_not_found', 'invalid_request_error'));
-      }
-    }
 
     if (payload.stream) {
       try {
@@ -152,9 +155,18 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
     if (errMsg.includes('MODEL_NOT_ALLOWED')) {
       statusCode = 403;
       errCode = 'model_not_available';
-    } else if (errMsg.includes('INVALID_REQUEST') || errMsg.includes('FILE_ACCOUNT_MISMATCH')) {
+    } else if (
+      errMsg.includes('INVALID_REQUEST') ||
+      errMsg.includes('FILE_ACCOUNT_MISMATCH') ||
+      errMsg.includes('FILE_NOT_FOUND_OR_EXPIRED') ||
+      errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE')
+    ) {
       statusCode = 400;
-      errCode = 'invalid_request_error';
+      errCode = errMsg.includes('FILE_NOT_FOUND_OR_EXPIRED')
+        ? 'file_not_found_or_expired'
+        : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE')
+        ? 'conversation_account_unavailable'
+        : 'invalid_request_error';
     } else if (errMsg.includes('NO_HEALTHY_ACCOUNTS')) {
       statusCode = 503;
       errCode = 'no_healthy_accounts';
@@ -215,21 +227,20 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
 });
 
 /**
- * GET /v1/media/:id (Media Proxy)
+ * GET /v1/media/:id (RAM Media Proxy with TTL)
  */
 openaiRouter.get('/media/:id', async (req: Request, res: Response) => {
-  const item = db.getMediaCache(req.params.id);
+  const item = ramMediaCache.getMedia(req.params.id);
   if (!item) {
-    return res.status(404).json({ error: 'Media artifact not found' });
+    return res.status(404).json({ error: 'Media artifact not found or expired' });
   }
-  const buffer = Buffer.from(item.data_b64, 'base64');
-  res.setHeader('Content-Type', item.mime_type || 'image/png');
-  res.setHeader('Cache-Control', 'public, max-age=86400');
-  return res.send(buffer);
+  res.setHeader('Content-Type', item.mimeType || 'image/png');
+  res.setHeader('Cache-Control', 'public, max-age=7200');
+  return res.send(item.buffer);
 });
 
 /**
- * POST /v1/files (Upload file upstream)
+ * POST /v1/files (Upload file upstream & store affinity in RAM)
  */
 openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) => {
   const apiKey = (req as any).gatewayApiKey;
@@ -260,16 +271,8 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
     );
 
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
-    db.saveUploadedFile({
-      id: uploaded.id,
-      account_id: targetAccount.id,
-      name: uploaded.name,
-      mime_type: mime_type || 'application/octet-stream',
-      size: buffer.length,
-      created_at: now.toISOString(),
-      expires_at: expiresAt,
-    });
+    // Record affinity in RAM with TTL (24h)
+    accountScheduler.setUploadedFileAffinity(uploaded.id, targetAccount.id);
 
     return res.json({
       id: uploaded.id,
@@ -286,42 +289,10 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
 });
 
 /**
- * CONVERSATION MANAGEMENT
+ * UPSTREAM CONVERSATION RELAY (Gemini Web is Single Source of Truth)
  */
 
-// POST /v1/conversations
-openaiRouter.post('/conversations', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const id = `conv_${crypto.randomBytes(12).toString('hex')}`;
-  const title = (req.body?.title || 'New Conversation').trim().slice(0, 100);
-  const defaultModel = accountScheduler.getAvailableModels()[0] || 'gemini-2.5-flash';
-  const model = req.body?.model || defaultModel;
-  const now = new Date().toISOString();
-
-  const conv = {
-    id,
-    title,
-    model,
-    account_id: '',
-    api_key_id: apiKey.id,
-    created_at: now,
-    updated_at: now,
-  };
-
-  db.createConversation(conv);
-  await rateLimiter.release(apiKey.id);
-  return res.status(201).json(conv);
-});
-
-// GET /v1/conversations
-openaiRouter.get('/conversations', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const convs = db.listConversations(apiKey.id);
-  await rateLimiter.release(apiKey.id);
-  return res.json({ object: 'list', data: convs });
-});
-
-// GET /v1/conversations/upstream-recent (Registered before /:id to prevent route shadowing)
+// GET /v1/conversations/upstream-recent
 openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: Request, res: Response) => {
   const apiKey = (req as any).gatewayApiKey;
   const targetAccount = accountScheduler.selectAnyActiveAccount();
@@ -334,6 +305,14 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
   try {
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
     const conversations = await geminiProvider.fetchRecentConversations(targetAccount, limit);
+
+    // Register RAM affinity for discovered conversations
+    for (const c of conversations) {
+      if (c.id) {
+        accountScheduler.setConversationAffinity(c.id, targetAccount.id);
+      }
+    }
+
     return res.json({
       object: 'list',
       data: conversations,
@@ -345,7 +324,7 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
   }
 });
 
-// GET /v1/conversations/upstream/:cid/turns (Registered before /:id)
+// GET /v1/conversations/upstream/:cid/turns
 openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (req: Request, res: Response) => {
   const apiKey = (req as any).gatewayApiKey;
   const targetAccount = accountScheduler.selectAnyActiveAccount();
@@ -357,6 +336,9 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
 
   try {
     const data = await geminiProvider.fetchConversationHistory(targetAccount, req.params.cid);
+    // Register RAM affinity for this conversation
+    accountScheduler.setConversationAffinity(req.params.cid, targetAccount.id);
+
     return res.json({
       conversation_id: req.params.cid,
       turns: data.turns,
@@ -370,76 +352,14 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
   }
 });
 
-// GET /v1/conversations/:id
-openaiRouter.get('/conversations/:id', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const conv = db.getConversation(req.params.id);
-  await rateLimiter.release(apiKey.id);
-
-  if (!conv || conv.api_key_id !== apiKey.id) {
-    return res.status(404).json(OpenAIAdapter.formatError('Conversation not found', 'conversation_not_found'));
-  }
-
-  const messages = db.listMessages(conv.id);
-  return res.json({ ...conv, messages });
+// Deprecated local conversation routes (Stateless Gateway)
+openaiRouter.all(['/conversations', '/conversations/*'], authMiddleware, async (req: Request, res: Response) => {
+  await rateLimiter.release((req as any).gatewayApiKey.id);
+  return res.status(410).json(
+    OpenAIAdapter.formatError(
+      'Local conversation persistence has been removed. Gateway is stateless; use upstream Gemini endpoints (/v1/conversations/upstream-recent, /v1/conversations/upstream/:cid/turns) and pass conversation_id / upstream metadata to /v1/chat/completions.',
+      'deprecated_endpoint',
+      'invalid_request_error'
+    )
+  );
 });
-
-// DELETE /v1/conversations/:id
-openaiRouter.delete('/conversations/:id', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const conv = db.getConversation(req.params.id);
-  await rateLimiter.release(apiKey.id);
-
-  if (!conv || conv.api_key_id !== apiKey.id) {
-    return res.status(404).json(OpenAIAdapter.formatError('Conversation not found', 'conversation_not_found'));
-  }
-
-  db.deleteConversation(conv.id);
-  return res.json({ id: conv.id, deleted: true });
-});
-
-// POST /v1/conversations/:id/messages
-openaiRouter.post('/conversations/:id/messages', authMiddleware, async (req: Request, res: Response) => {
-  const apiKey = (req as any).gatewayApiKey;
-  const conv = db.getConversation(req.params.id);
-  if (!conv || conv.api_key_id !== apiKey.id) {
-    await rateLimiter.release(apiKey.id);
-    return res.status(404).json(OpenAIAdapter.formatError('Conversation not found', 'conversation_not_found'));
-  }
-
-  const requestId = `req_${crypto.randomBytes(8).toString('hex')}`;
-  res.setHeader('x-request-id', requestId);
-
-  try {
-    const content = req.body?.content || '';
-    if (!content) {
-      return res.status(400).json(OpenAIAdapter.formatError('Message content is required', 'missing_content'));
-    }
-
-    const history = db.listMessages(conv.id);
-    const messages = history.map((m) => ({
-      role: m.role as any,
-      content: m.content,
-    }));
-    messages.push({ role: 'user', content });
-
-    const payload: any = {
-      model: req.body?.model || conv.model,
-      messages,
-      conversation_id: conv.id,
-      upstream_cid: conv.upstream_cid,
-      upstream_rid: conv.upstream_rid,
-      upstream_rcid: conv.upstream_rcid,
-      stream: false,
-    };
-
-    const { response } = await gatewayService.handleChatCompletion(payload, apiKey, requestId);
-    return res.json(response);
-  } catch (err: any) {
-    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to send message', 'conversation_error'));
-  } finally {
-    await rateLimiter.release(apiKey.id);
-  }
-});
-
-

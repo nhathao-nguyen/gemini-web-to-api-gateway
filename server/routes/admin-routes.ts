@@ -495,6 +495,11 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
   try {
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit || '10'), 10)));
     const conversations = await geminiProvider.fetchRecentConversations(targetAccount, limit);
+    for (const c of conversations) {
+      if (c.id) {
+        accountScheduler.setConversationAffinity(c.id, targetAccount.id);
+      }
+    }
     return res.json({
       account_id: targetAccount.id,
       account_name: targetAccount.name,
@@ -519,6 +524,7 @@ adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: 
 
   try {
     const data = await geminiProvider.fetchConversationHistory(targetAccount, cid);
+    accountScheduler.setConversationAffinity(cid, targetAccount.id);
     return res.json({
       conversation_id: cid,
       account_id: targetAccount.id,

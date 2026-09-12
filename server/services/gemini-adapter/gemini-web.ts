@@ -94,6 +94,107 @@ export async function fetchWithTimeout(
   }
 }
 
+/**
+ * Check if request has sufficient native Gemini conversation state (c_ CID, RID, and RCID)
+ * to continue the conversation thread without replaying previous history turns.
+ */
+export function hasUsableNativeConversationState(request: ChatCompletionRequest): boolean {
+  const cid = (request.upstream_cid || request.conversation_id || '').trim();
+  const rid = (request.upstream_rid || '').trim();
+  const rcid = (request.upstream_rcid || '').trim();
+  return Boolean(cid.startsWith('c_') && rid && rcid);
+}
+
+/**
+ * Read response body as text with timeout and external client abort support
+ */
+export async function readBodyWithTimeout(
+  res: Response,
+  timeoutMs: number = config.requestTimeout || 60000,
+  signal?: AbortSignal
+): Promise<string> {
+  if (signal?.aborted) {
+    throw new Error('CLIENT_ABORT: Request cancelled by client');
+  }
+
+  let timer: NodeJS.Timeout | null = null;
+  let onAbort: (() => void) | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`UPSTREAM_TIMEOUT: Response body read timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (signal) {
+      onAbort = () => {
+        reject(new Error('CLIENT_ABORT: Request cancelled by client'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+
+  try {
+    return await Promise.race([res.text(), timeoutPromise, abortPromise]);
+  } catch (err: any) {
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
+/**
+ * Read response body as arrayBuffer with timeout and external client abort support
+ */
+export async function readBufferWithTimeout(
+  res: Response,
+  timeoutMs: number = config.requestTimeout || 60000,
+  signal?: AbortSignal
+): Promise<ArrayBuffer> {
+  if (signal?.aborted) {
+    throw new Error('CLIENT_ABORT: Request cancelled by client');
+  }
+
+  let timer: NodeJS.Timeout | null = null;
+  let onAbort: (() => void) | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`UPSTREAM_TIMEOUT: Response buffer read timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (signal) {
+      onAbort = () => {
+        reject(new Error('CLIENT_ABORT: Request cancelled by client'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+
+  try {
+    return await Promise.race([res.arrayBuffer(), timeoutPromise, abortPromise]);
+  } catch (err: any) {
+    if (signal?.aborted) {
+      throw new Error('CLIENT_ABORT: Request cancelled by client');
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -1392,7 +1493,8 @@ export class GeminiWebProvider implements AIProvider {
   public async downloadGeneratedImage(
     account: GeminiAccount,
     rawUrl: string,
-    targetSize = 2048
+    targetSize = 2048,
+    signal?: AbortSignal
   ): Promise<{ data: Buffer; mimeType: string }> {
     const session = await this.getOrFetchSession(account);
     let imageUrl = rawUrl;
@@ -1408,7 +1510,7 @@ export class GeminiWebProvider implements AIProvider {
         'Cookie': session.cookieHeader,
       },
       dispatcher,
-    } as any);
+    } as any, config.requestTimeout || 60000, signal);
 
     if (!res.ok && (res.status === 403 || res.status === 401)) {
       // Retry without Cookie header as Google User Content CDN often rejects session cookies
@@ -1418,7 +1520,7 @@ export class GeminiWebProvider implements AIProvider {
           'Referer': 'https://gemini.google.com/',
         },
         dispatcher,
-      } as any);
+      } as any, config.requestTimeout || 60000, signal);
     }
 
     if (!res.ok) {
@@ -1426,7 +1528,7 @@ export class GeminiWebProvider implements AIProvider {
     }
 
     const mimeType = res.headers.get('content-type') || 'image/png';
-    const arrayBuffer = await res.arrayBuffer();
+    const arrayBuffer = await readBufferWithTimeout(res, config.requestTimeout || 60000, signal);
     return { data: Buffer.from(arrayBuffer), mimeType };
   }
 
@@ -1454,10 +1556,10 @@ export class GeminiWebProvider implements AIProvider {
     const session = await this.getOrFetchSession(account);
     const resolvedModel = resolveGeminiModel(request.model, session.discoveredModels);
 
-    // Pass native Gemini conversation state if available (only real upstream c_ IDs, never local conv_ IDs or arbitrary test inputs like '123')
+    // Pass native Gemini conversation state only when full turn metadata (cid, rid, rcid) is available
+    const hasNativeConversation = hasUsableNativeConversationState(request);
     const rawCid = (request.upstream_cid || request.conversation_id || '').trim();
     const nativeCid = rawCid.startsWith('c_') ? rawCid : undefined;
-    const hasNativeConversation = Boolean(nativeCid);
 
     let { prompt, attachments } = this.buildPromptAndAttachments(request.messages, hasNativeConversation);
 
@@ -1477,11 +1579,13 @@ export class GeminiWebProvider implements AIProvider {
     const requestId = crypto.randomUUID().toUpperCase();
     const isTemporary = false;
 
-    const metadata = {
-      cid: nativeCid,
-      rid: request.upstream_rid,
-      rcid: request.upstream_rcid,
-    };
+    const metadata = hasNativeConversation
+      ? {
+          cid: nativeCid,
+          rid: request.upstream_rid,
+          rcid: request.upstream_rcid,
+        }
+      : undefined;
 
     const wantsThinking =
       request.thinking === true ||
@@ -1571,7 +1675,7 @@ export class GeminiWebProvider implements AIProvider {
     signal?: AbortSignal
   ): Promise<AIProviderResult> {
     const { res } = await this.executeRpc(account, request, signal);
-    const textBody = await res.text();
+    const textBody = await readBodyWithTimeout(res, config.requestTimeout || 60000, signal);
     const parsed = parseGoogleWireResponse(textBody);
 
     let text = parsed.text;
@@ -1642,14 +1746,60 @@ export class GeminiWebProvider implements AIProvider {
       stopList = (Array.isArray(request.stop) ? request.stop : [request.stop]).filter(Boolean);
     }
 
+    const streamTimeoutMs = config.requestTimeout || 60000;
+    const streamDeadline = Date.now() + streamTimeoutMs;
+
     try {
       while (true) {
-        if (signal?.aborted || hitStop) {
+        if (signal?.aborted) {
+          await reader.cancel().catch(() => {});
+          throw new Error('CLIENT_ABORT: Request cancelled by client');
+        }
+        if (Date.now() > streamDeadline) {
+          await reader.cancel().catch(() => {});
+          throw new Error(`UPSTREAM_TIMEOUT: Upstream streaming timed out after ${streamTimeoutMs}ms`);
+        }
+        if (hitStop) {
           await reader.cancel().catch(() => {});
           break;
         }
 
-        const { done, value } = await reader.read();
+        const remainingMs = Math.max(1000, streamDeadline - Date.now());
+        let readTimer: NodeJS.Timeout | null = null;
+        let onClientAbort: (() => void) | null = null;
+
+        const readTimeoutPromise = new Promise<never>((_, reject) => {
+          readTimer = setTimeout(() => {
+            reject(new Error(`UPSTREAM_TIMEOUT: Upstream streaming chunk read timed out after ${streamTimeoutMs}ms`));
+          }, remainingMs);
+        });
+
+        const abortPromise = new Promise<never>((_, reject) => {
+          if (signal) {
+            onClientAbort = () => {
+              reject(new Error('CLIENT_ABORT: Request cancelled by client'));
+            };
+            signal.addEventListener('abort', onClientAbort, { once: true });
+          }
+        });
+
+        let chunkRead;
+        try {
+          chunkRead = await Promise.race([reader.read(), readTimeoutPromise, abortPromise]);
+        } catch (err: any) {
+          await reader.cancel().catch(() => {});
+          if (signal?.aborted) {
+            throw new Error('CLIENT_ABORT: Request cancelled by client');
+          }
+          throw err;
+        } finally {
+          if (readTimer) clearTimeout(readTimer);
+          if (signal && onClientAbort) {
+            signal.removeEventListener('abort', onClientAbort);
+          }
+        }
+
+        const { done, value } = chunkRead;
 
         if (value) {
           if (upstreamFirstChunkTs === null) {
@@ -1876,7 +2026,7 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch recent conversations: HTTP ${res.status}`);
     }
 
-    const text = await res.text();
+    const text = await readBodyWithTimeout(res, config.requestTimeout || 60000);
     return parseGeminiRecentConversations(text);
   }
 
@@ -1922,7 +2072,7 @@ export class GeminiWebProvider implements AIProvider {
       },
       body: form.toString(),
       dispatcher,
-    } as any);
+    } as any, config.requestTimeout || 60000);
 
     console.log(`[Upstream Gemini Web ReadConversation] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -1934,7 +2084,7 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch conversation history: HTTP ${res.status}`);
     }
 
-    const text = await res.text();
+    const text = await readBodyWithTimeout(res, config.requestTimeout || 60000);
     return parseGeminiConversationHistory(text);
   }
 }

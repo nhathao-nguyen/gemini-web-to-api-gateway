@@ -410,7 +410,6 @@ export const PlaygroundPage: React.FC = () => {
       const requestPayload: any = {
         model: selectedModel,
         messages: messagesPayload,
-        temperature,
         max_tokens: maxTokens,
         stream,
         thinking: extendedThinking,

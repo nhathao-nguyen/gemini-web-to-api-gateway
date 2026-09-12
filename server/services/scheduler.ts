@@ -2,10 +2,11 @@ import { db } from '../db/database.js';
 import { GeminiAccount } from '../types.js';
 import { quotaManager } from './quota-manager.js';
 
-interface StickySessionEntry {
+interface AffinityEntry {
   accountId: string;
   expiresAt: number;
 }
+type StickySessionEntry = AffinityEntry;
 
 export const DEFAULT_GEMINI_MODELS = [
   'gemini-3.8-flash',
@@ -22,6 +23,21 @@ export class AccountScheduler {
   // Sticky sessions mapping: conversation_id -> { accountId, expiresAt }
   private stickySessions = new Map<string, StickySessionEntry>();
 
+  // Hard conversation affinity mapping: cid -> { accountId, expiresAt } (24h TTL)
+  private conversationAffinity = new Map<string, AffinityEntry>();
+
+  // Hard uploaded file affinity mapping: fileId -> { accountId, expiresAt } (24h TTL)
+  private uploadedFileAffinity = new Map<string, AffinityEntry>();
+
+  private cleanupTimer: NodeJS.Timeout | null = null;
+
+  constructor() {
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupAffinities();
+    }, 10 * 60 * 1000);
+    this.cleanupTimer.unref();
+  }
+
   /**
    * Register start of in-flight request
    */
@@ -36,6 +52,110 @@ export class AccountScheduler {
   public decrementActive(accountId: string) {
     const curr = this.activeRequests.get(accountId) || 0;
     this.activeRequests.set(accountId, Math.max(0, curr - 1));
+  }
+
+  /**
+   * Set conversation affinity with TTL (default 24h)
+   */
+  public setConversationAffinity(conversationId: string, accountId: string, ttlMs = 24 * 60 * 60 * 1000) {
+    if (!conversationId) return;
+    this.conversationAffinity.set(conversationId, {
+      accountId,
+      expiresAt: Date.now() + ttlMs,
+    });
+  }
+
+  /**
+   * Get conversation affinity if not expired
+   */
+  public getConversationAffinity(conversationId: string): string | null {
+    if (!conversationId) return null;
+    const entry = this.conversationAffinity.get(conversationId);
+    if (!entry) return null;
+
+    if (Date.now() > entry.expiresAt) {
+      this.conversationAffinity.delete(conversationId);
+      return null;
+    }
+    return entry.accountId;
+  }
+
+  /**
+   * Set uploaded file affinity with TTL (default 24h)
+   */
+  public setUploadedFileAffinity(fileId: string, accountId: string, ttlMs = 24 * 60 * 60 * 1000) {
+    if (!fileId) return;
+    this.uploadedFileAffinity.set(fileId, {
+      accountId,
+      expiresAt: Date.now() + ttlMs,
+    });
+  }
+
+  /**
+   * Get uploaded file affinity if not expired
+   */
+  public getUploadedFileAffinity(fileId: string): string | null {
+    if (!fileId) return null;
+    const entry = this.uploadedFileAffinity.get(fileId);
+    if (!entry) return null;
+
+    if (Date.now() > entry.expiresAt) {
+      this.uploadedFileAffinity.delete(fileId);
+      return null;
+    }
+    return entry.accountId;
+  }
+
+  /**
+   * Validate all uploaded files in a request:
+   * - unknown or expired -> throw FILE_NOT_FOUND_OR_EXPIRED
+   * - multiple accounts -> throw FILE_ACCOUNT_MISMATCH
+   * - return target account ID
+   */
+  public checkUploadedFilesAffinity(files: Array<{ id: string; name?: string }>): string {
+    if (!files || files.length === 0) {
+      throw new Error('FILE_NOT_FOUND_OR_EXPIRED: No files specified');
+    }
+
+    let targetAccountId: string | null = null;
+    for (const f of files) {
+      const accountId = this.getUploadedFileAffinity(f.id);
+      if (!accountId) {
+        throw new Error(`FILE_NOT_FOUND_OR_EXPIRED: Uploaded file "${f.name || f.id}" does not exist or has expired`);
+      }
+      if (!targetAccountId) {
+        targetAccountId = accountId;
+      } else if (targetAccountId !== accountId) {
+        throw new Error('FILE_ACCOUNT_MISMATCH: Uploaded files belong to multiple different Gemini accounts and cannot be combined in a single request');
+      }
+    }
+
+    return targetAccountId!;
+  }
+
+  /**
+   * Cleanup expired affinities
+   */
+  public cleanupAffinities() {
+    const now = Date.now();
+    for (const [k, v] of this.stickySessions.entries()) {
+      if (now > v.expiresAt) this.stickySessions.delete(k);
+    }
+    for (const [k, v] of this.conversationAffinity.entries()) {
+      if (now > v.expiresAt) this.conversationAffinity.delete(k);
+    }
+    for (const [k, v] of this.uploadedFileAffinity.entries()) {
+      if (now > v.expiresAt) this.uploadedFileAffinity.delete(k);
+    }
+  }
+
+  /**
+   * Clear in-memory affinity tables (for testing restart semantics)
+   */
+  public clearAffinities() {
+    this.stickySessions.clear();
+    this.conversationAffinity.clear();
+    this.uploadedFileAffinity.clear();
   }
 
   /**

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import pg from 'pg';
 import { DatabaseSync } from 'node:sqlite';
-import { GeminiAccount, AccountStatus, ApiKey, RequestLog, AccountEvent, Conversation, Message, MediaCache, UploadedFileRecord } from '../types.js';
+import { GeminiAccount, AccountStatus, ApiKey, RequestLog, AccountEvent } from '../types.js';
 import { config } from '../config.js';
 
 const { Pool } = pg;
@@ -12,10 +12,6 @@ interface DatabaseData {
   api_keys: ApiKey[];
   request_logs: RequestLog[];
   account_events: AccountEvent[];
-  conversations: Conversation[];
-  messages: Message[];
-  media_cache: MediaCache[];
-  uploaded_files: UploadedFileRecord[];
   settings: Record<string, any>;
 }
 
@@ -37,10 +33,6 @@ export class Database {
       api_keys: [],
       request_logs: [],
       account_events: [],
-      conversations: [],
-      messages: [],
-      media_cache: [],
-      uploaded_files: [],
       settings: {
         request_body_logging: false,
         max_upstream_attempts: 2,
@@ -155,50 +147,6 @@ export class Database {
           value TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS conversations (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          model TEXT NOT NULL,
-          account_id TEXT NOT NULL,
-          upstream_cid TEXT,
-          upstream_rid TEXT,
-          upstream_rcid TEXT,
-          api_key_id TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS messages (
-          id TEXT PRIMARY KEY,
-          conversation_id TEXT NOT NULL,
-          role TEXT NOT NULL,
-          content TEXT NOT NULL,
-          reasoning_content TEXT,
-          attachments TEXT NOT NULL DEFAULT '[]',
-          generated_media TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS media_cache (
-          id TEXT PRIMARY KEY,
-          account_id TEXT NOT NULL,
-          upstream_url TEXT NOT NULL,
-          mime_type TEXT NOT NULL DEFAULT 'image/png',
-          file_name TEXT NOT NULL DEFAULT 'image.png',
-          data_b64 TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS uploaded_files (
-          id TEXT PRIMARY KEY,
-          account_id TEXT NOT NULL,
-          name TEXT NOT NULL,
-          mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-          size INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL,
-          expires_at TEXT NOT NULL
-        );
       `);
 
       // SQLite column migrations
@@ -301,65 +249,9 @@ export class Database {
         }));
       }
 
-      const convRows = this.sqliteDb.prepare('SELECT * FROM conversations ORDER BY updated_at DESC').all();
-      if (convRows && convRows.length > 0) {
-        this.data.conversations = convRows.map((c: any) => ({
-          id: c.id,
-          title: c.title,
-          model: c.model,
-          account_id: c.account_id,
-          upstream_cid: c.upstream_cid || undefined,
-          upstream_rid: c.upstream_rid || undefined,
-          upstream_rcid: c.upstream_rcid || undefined,
-          api_key_id: c.api_key_id || '',
-          created_at: c.created_at,
-          updated_at: c.updated_at,
-        }));
-      }
-
-      const msgRows = this.sqliteDb.prepare('SELECT * FROM messages ORDER BY created_at ASC').all();
-      if (msgRows && msgRows.length > 0) {
-        this.data.messages = msgRows.map((m: any) => ({
-          id: m.id,
-          conversation_id: m.conversation_id,
-          role: m.role,
-          content: m.content,
-          reasoning_content: m.reasoning_content || undefined,
-          attachments: JSON.parse(m.attachments || '[]'),
-          generated_media: JSON.parse(m.generated_media || '[]'),
-          created_at: m.created_at,
-        }));
-      }
-
-      const mediaRows = this.sqliteDb.prepare('SELECT * FROM media_cache ORDER BY created_at DESC LIMIT 500').all();
-      if (mediaRows && mediaRows.length > 0) {
-        this.data.media_cache = mediaRows.map((m: any) => ({
-          id: m.id,
-          account_id: m.account_id,
-          upstream_url: m.upstream_url,
-          mime_type: m.mime_type,
-          file_name: m.file_name,
-          data_b64: m.data_b64,
-          created_at: m.created_at,
-        }));
-      }
-
-      const fileRows = this.sqliteDb.prepare('SELECT * FROM uploaded_files').all();
-      if (fileRows && fileRows.length > 0) {
-        this.data.uploaded_files = fileRows.map((f: any) => ({
-          id: f.id,
-          account_id: f.account_id,
-          name: f.name,
-          mime_type: f.mime_type,
-          size: Number(f.size || 0),
-          created_at: f.created_at,
-          expires_at: f.expires_at,
-        }));
-      }
-
       this.isSqliteReady = true;
       console.log(
-        `[Database] SQLite ready. Loaded ${this.data.accounts.length} accounts, ${this.data.api_keys.length} API keys, and ${this.data.conversations.length} conversations from gateway.db.`
+        `[Database] SQLite ready. Loaded ${this.data.accounts.length} accounts and ${this.data.api_keys.length} API keys from gateway.db.`
       );
     } catch (err) {
       console.error('[Database] Failed to initialize SQLite database:', err);
@@ -1148,242 +1040,6 @@ export class Database {
     return this.data.account_events.slice(0, limit);
   }
 
-  // --- CONVERSATIONS ---
-  public createConversation(conv: Conversation): void {
-    this.data.conversations.unshift(conv);
-
-    if (this.isSqliteReady && this.sqliteDb) {
-      try {
-        const stmt = this.sqliteDb.prepare(`
-          INSERT INTO conversations (id, title, model, account_id, upstream_cid, upstream_rid, upstream_rcid, api_key_id, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-        stmt.run(
-          conv.id,
-          conv.title,
-          conv.model,
-          conv.account_id,
-          conv.upstream_cid || null,
-          conv.upstream_rid || null,
-          conv.upstream_rcid || null,
-          conv.api_key_id,
-          conv.created_at,
-          conv.updated_at
-        );
-      } catch (err) {
-        console.error('[Database] SQLite insert conversation error:', err);
-      }
-    }
-
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO conversations (id, title, model, account_id, upstream_cid, upstream_rid, upstream_rcid, api_key_id, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-          [
-            conv.id,
-            conv.title,
-            conv.model,
-            conv.account_id,
-            conv.upstream_cid || null,
-            conv.upstream_rid || null,
-            conv.upstream_rcid || null,
-            conv.api_key_id,
-            conv.created_at,
-            conv.updated_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres insert conversation error:', err));
-    }
-  }
-
-  public getConversation(id: string): Conversation | undefined {
-    return this.data.conversations.find((c) => c.id === id);
-  }
-
-  public listConversations(apiKeyId?: string): Conversation[] {
-    if (!apiKeyId) return [...this.data.conversations];
-    return this.data.conversations.filter((c) => c.api_key_id === apiKeyId);
-  }
-
-  public updateConversation(id: string, updates: Partial<Conversation>): void {
-    const idx = this.data.conversations.findIndex((c) => c.id === id);
-    if (idx !== -1) {
-      this.data.conversations[idx] = {
-        ...this.data.conversations[idx],
-        ...updates,
-        updated_at: new Date().toISOString(),
-      };
-      const conv = this.data.conversations[idx];
-
-      if (this.isSqliteReady && this.sqliteDb) {
-        try {
-          const stmt = this.sqliteDb.prepare(`
-            UPDATE conversations
-            SET title = ?, model = ?, account_id = ?, upstream_cid = ?, upstream_rid = ?, upstream_rcid = ?, updated_at = ?
-            WHERE id = ?
-          `);
-          stmt.run(
-            conv.title,
-            conv.model,
-            conv.account_id,
-            conv.upstream_cid || null,
-            conv.upstream_rid || null,
-            conv.upstream_rcid || null,
-            conv.updated_at,
-            id
-          );
-        } catch (err) {
-          console.error('[Database] SQLite update conversation error:', err);
-        }
-      }
-
-      if (this.isPgReady && this.pgPool) {
-        this.pgPool
-          .query(
-            `UPDATE conversations
-             SET title = $1, model = $2, account_id = $3, upstream_cid = $4, upstream_rid = $5, upstream_rcid = $6, updated_at = $7
-             WHERE id = $8`,
-            [
-              conv.title,
-              conv.model,
-              conv.account_id,
-              conv.upstream_cid || null,
-              conv.upstream_rid || null,
-              conv.upstream_rcid || null,
-              conv.updated_at,
-              id,
-            ]
-          )
-          .catch((err) => console.error('[Database] Postgres update conversation error:', err));
-      }
-    }
-  }
-
-  public deleteConversation(id: string): void {
-    this.data.conversations = this.data.conversations.filter((c) => c.id !== id);
-    this.data.messages = this.data.messages.filter((m) => m.conversation_id !== id);
-
-    if (this.isSqliteReady && this.sqliteDb) {
-      try {
-        this.sqliteDb.prepare('DELETE FROM messages WHERE conversation_id = ?').run(id);
-        this.sqliteDb.prepare('DELETE FROM conversations WHERE id = ?').run(id);
-      } catch (err) {
-        console.error('[Database] SQLite delete conversation error:', err);
-      }
-    }
-
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query('DELETE FROM conversations WHERE id = $1', [id])
-        .catch((err) => console.error('[Database] Postgres delete conversation error:', err));
-    }
-  }
-
-  // --- MESSAGES ---
-  public createMessage(msg: Message): void {
-    this.data.messages.push(msg);
-    if (this.data.messages.length > 5000) {
-      this.data.messages = this.data.messages.slice(-5000);
-    }
-
-    if (this.isSqliteReady && this.sqliteDb) {
-      try {
-        const stmt = this.sqliteDb.prepare(`
-          INSERT INTO messages (id, conversation_id, role, content, reasoning_content, attachments, generated_media, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-        stmt.run(
-          msg.id,
-          msg.conversation_id,
-          msg.role,
-          msg.content,
-          msg.reasoning_content || null,
-          JSON.stringify(msg.attachments || []),
-          JSON.stringify(msg.generated_media || []),
-          msg.created_at
-        );
-      } catch (err) {
-        console.error('[Database] SQLite insert message error:', err);
-      }
-    }
-
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO messages (id, conversation_id, role, content, reasoning_content, attachments, generated_media, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            msg.id,
-            msg.conversation_id,
-            msg.role,
-            msg.content,
-            msg.reasoning_content || null,
-            JSON.stringify(msg.attachments || []),
-            JSON.stringify(msg.generated_media || []),
-            msg.created_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres insert message error:', err));
-    }
-  }
-
-  public listMessages(conversationId: string): Message[] {
-    return this.data.messages.filter((m) => m.conversation_id === conversationId);
-  }
-
-  // --- MEDIA CACHE ---
-  public saveMediaCache(media: MediaCache): void {
-    const existingIdx = this.data.media_cache.findIndex((m) => m.id === media.id);
-    if (existingIdx !== -1) {
-      this.data.media_cache[existingIdx] = media;
-    } else {
-      this.data.media_cache.unshift(media);
-    }
-
-    if (this.isSqliteReady && this.sqliteDb) {
-      try {
-        const stmt = this.sqliteDb.prepare(`
-          INSERT OR REPLACE INTO media_cache (id, account_id, upstream_url, mime_type, file_name, data_b64, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `);
-        stmt.run(
-          media.id,
-          media.account_id,
-          media.upstream_url,
-          media.mime_type,
-          media.file_name,
-          media.data_b64,
-          media.created_at
-        );
-      } catch (err) {
-        console.error('[Database] SQLite insert media_cache error:', err);
-      }
-    }
-
-    if (this.isPgReady && this.pgPool) {
-      this.pgPool
-        .query(
-          `INSERT INTO media_cache (id, account_id, upstream_url, mime_type, file_name, data_b64, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           ON CONFLICT (id) DO UPDATE SET data_b64 = EXCLUDED.data_b64`,
-          [
-            media.id,
-            media.account_id,
-            media.upstream_url,
-            media.mime_type,
-            media.file_name,
-            media.data_b64,
-            media.created_at,
-          ]
-        )
-        .catch((err) => console.error('[Database] Postgres insert media_cache error:', err));
-    }
-  }
-
-  public getMediaCache(id: string): MediaCache | undefined {
-    return this.data.media_cache.find((m) => m.id === id);
-  }
 
   // --- METRICS ---
   public getAnalytics() {
@@ -1424,63 +1080,9 @@ export class Database {
     };
   }
 
-  // --- UPLOADED FILES & RETENTION ---
-  public saveUploadedFile(file: UploadedFileRecord): void {
-    const existingIdx = this.data.uploaded_files.findIndex((f) => f.id === file.id);
-    if (existingIdx !== -1) {
-      this.data.uploaded_files[existingIdx] = file;
-    } else {
-      this.data.uploaded_files.push(file);
-    }
-
-    if (this.isSqliteReady && this.sqliteDb) {
-      try {
-        this.sqliteDb
-          .prepare(
-            `INSERT OR REPLACE INTO uploaded_files (id, account_id, name, mime_type, size, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(file.id, file.account_id, file.name, file.mime_type, file.size, file.created_at, file.expires_at);
-      } catch (err) {
-        console.error('[Database] SQLite save uploaded_file error:', err);
-      }
-    }
-  }
-
-  public getUploadedFile(id: string): UploadedFileRecord | undefined {
-    if (this.isSqliteReady && this.sqliteDb) {
-      try {
-        const row = this.sqliteDb.prepare('SELECT * FROM uploaded_files WHERE id = ?').get(id);
-        if (row) {
-          const rec: UploadedFileRecord = {
-            id: row.id,
-            account_id: row.account_id,
-            name: row.name,
-            mime_type: row.mime_type,
-            size: Number(row.size || 0),
-            created_at: row.created_at,
-            expires_at: row.expires_at,
-          };
-          const idx = this.data.uploaded_files.findIndex((f) => f.id === id);
-          if (idx !== -1) {
-            this.data.uploaded_files[idx] = rec;
-          } else {
-            this.data.uploaded_files.push(rec);
-          }
-          return rec;
-        }
-      } catch (err) {
-        console.warn('[Database] SQLite getUploadedFile error:', err);
-      }
-    }
-    return this.data.uploaded_files.find((f) => f.id === id);
-  }
-
-  public cleanupRetention(): { logsDeleted: number; eventsDeleted: number; mediaDeleted: number; filesDeleted: number } {
+  public cleanupRetention(): { logsDeleted: number; eventsDeleted: number } {
     let logsDeleted = 0;
     let eventsDeleted = 0;
-    let mediaDeleted = 0;
-    let filesDeleted = 0;
 
     if (this.isSqliteReady && this.sqliteDb) {
       try {
@@ -1505,33 +1107,12 @@ export class Database {
           )
           .run();
         eventsDeleted = Number(evtRes.changes || 0);
-
-        // Keep max 1,000 media or 7 days
-        const mediaRes = this.sqliteDb
-          .prepare(
-            `DELETE FROM media_cache
-             WHERE id NOT IN (
-               SELECT id FROM media_cache ORDER BY created_at DESC LIMIT 1000
-             ) OR created_at < datetime('now', '-7 days')`
-          )
-          .run();
-        mediaDeleted = Number(mediaRes.changes || 0);
-
-        // Expired uploaded files
-        const fileRes = this.sqliteDb
-          .prepare(`DELETE FROM uploaded_files WHERE expires_at < datetime('now')`)
-          .run();
-        filesDeleted = Number(fileRes.changes || 0);
-
-        // Sync in-memory uploaded_files
-        const nowIso = new Date().toISOString();
-        this.data.uploaded_files = this.data.uploaded_files.filter((f) => f.expires_at >= nowIso);
       } catch (err) {
         console.warn('[Database] SQLite retention cleanup warning:', err);
       }
     }
 
-    return { logsDeleted, eventsDeleted, mediaDeleted, filesDeleted };
+    return { logsDeleted, eventsDeleted };
   }
 }
 

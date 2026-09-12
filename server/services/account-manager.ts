@@ -180,13 +180,14 @@ export class AccountManager {
     const account = db.getAccountById(id);
     if (!account) return undefined;
 
-    if (updates.auth_user !== undefined && updates.auth_user !== account.auth_user) {
-      geminiProvider.invalidateSession(id);
-    }
-
     const { encrypted_cookie, id: _id, ...safeUpdates } = updates as any;
     const updated = db.updateAccount(id, safeUpdates);
     if (!updated) return undefined;
+
+    // 2. Invalidate old Gemini session cache if auth_user changed
+    if (updates.auth_user !== undefined && updates.auth_user !== account.auth_user) {
+      geminiProvider.invalidateSession(id);
+    }
 
     const { encrypted_cookie: _, ...safe } = updated;
     return safe;
