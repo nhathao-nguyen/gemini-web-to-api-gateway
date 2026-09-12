@@ -49,12 +49,30 @@ export function getDispatcherForProxy(proxyUrl?: string | null): Dispatcher | un
   return agent;
 }
 
+/**
+ * Calculate remaining milliseconds for an operation deadline and throw UPSTREAM_TIMEOUT if expired.
+ */
+export function getRemainingTimeout(deadline: number, phaseName = 'Operation'): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new Error(`UPSTREAM_TIMEOUT: ${phaseName} deadline exceeded`);
+  }
+  return remaining;
+}
+
 export async function fetchWithTimeout(
   url: string,
   init: RequestInit = {},
   timeoutMs: number = config.requestTimeout || 60000,
   externalSignal?: AbortSignal
 ): Promise<Response> {
+  if (externalSignal?.aborted) {
+    throw externalSignal.reason || new Error('CLIENT_ABORT: Request cancelled by client');
+  }
+  if (timeoutMs <= 0) {
+    throw new Error('UPSTREAM_TIMEOUT: Upstream request deadline already exceeded');
+  }
+
   const timeoutController = new AbortController();
   const timer = setTimeout(() => {
     timeoutController.abort(new Error(`UPSTREAM_TIMEOUT: Upstream request timed out after ${timeoutMs}ms`));
@@ -62,12 +80,8 @@ export async function fetchWithTimeout(
 
   let onExternalAbort: (() => void) | undefined;
   if (externalSignal) {
-    if (externalSignal.aborted) {
-      clearTimeout(timer);
-      throw externalSignal.reason || new Error('CLIENT_ABORT: Request aborted by client');
-    }
     onExternalAbort = () => {
-      timeoutController.abort(externalSignal.reason || new Error('CLIENT_ABORT: Request aborted by client'));
+      timeoutController.abort(externalSignal.reason || new Error('CLIENT_ABORT: Request cancelled by client'));
     };
     externalSignal.addEventListener('abort', onExternalAbort, { once: true });
   }
@@ -116,6 +130,9 @@ export async function readBodyWithTimeout(
   if (signal?.aborted) {
     throw new Error('CLIENT_ABORT: Request cancelled by client');
   }
+  if (timeoutMs <= 0) {
+    throw new Error('UPSTREAM_TIMEOUT: Response body read deadline already exceeded');
+  }
 
   let timer: NodeJS.Timeout | null = null;
   let onAbort: (() => void) | null = null;
@@ -160,6 +177,9 @@ export async function readBufferWithTimeout(
 ): Promise<ArrayBuffer> {
   if (signal?.aborted) {
     throw new Error('CLIENT_ABORT: Request cancelled by client');
+  }
+  if (timeoutMs <= 0) {
+    throw new Error('UPSTREAM_TIMEOUT: Response buffer read deadline already exceeded');
   }
 
   let timer: NodeJS.Timeout | null = null;
@@ -1401,8 +1421,11 @@ export class GeminiWebProvider implements AIProvider {
     account: GeminiAccount,
     filename: string,
     mimeType: string,
-    data: Buffer
+    data: Buffer,
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<UploadedFileRef> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
     const session = await this.getOrFetchSession(account);
     const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
 
@@ -1429,7 +1452,7 @@ export class GeminiWebProvider implements AIProvider {
       method: 'OPTIONS',
       headers: startHeaders,
       dispatcher,
-    } as any).catch(() => {});
+    } as any, getRemainingTimeout(opDeadline, 'Upload options 1'), signal).catch(() => {});
 
     // 2. POST start
     const startRes = await fetchWithTimeout('https://content-push.googleapis.com/upload', {
@@ -1437,7 +1460,7 @@ export class GeminiWebProvider implements AIProvider {
       headers: startHeaders,
       body: 'File name: ' + sanitizedFilename,
       dispatcher,
-    } as any);
+    } as any, getRemainingTimeout(opDeadline, 'Upload start'), signal);
 
     if (!startRes.ok) {
       throw new Error(`Upstream upload initialization failed: HTTP ${startRes.status}`);
@@ -1453,7 +1476,7 @@ export class GeminiWebProvider implements AIProvider {
       method: 'OPTIONS',
       headers: startHeaders,
       dispatcher,
-    } as any).catch(() => {});
+    } as any, getRemainingTimeout(opDeadline, 'Upload options 2'), signal).catch(() => {});
 
     // 4. POST file bytes & finalize
     const uploadRes = await fetchWithTimeout(uploadUrl, {
@@ -1473,14 +1496,13 @@ export class GeminiWebProvider implements AIProvider {
       },
       body: new Uint8Array(data),
       dispatcher,
-    } as any);
-
+    } as any, getRemainingTimeout(opDeadline, 'Upload bytes'), signal);
 
     if (!uploadRes.ok) {
       throw new Error(`Upstream file upload failed: HTTP ${uploadRes.status}`);
     }
 
-    const fileId = (await uploadRes.text()).trim();
+    const fileId = (await readBodyWithTimeout(uploadRes, getRemainingTimeout(opDeadline, 'Upload file ID read'), signal)).trim();
     if (!fileId) {
       throw new Error('Upstream file upload returned empty file ID');
     }
@@ -1494,8 +1516,10 @@ export class GeminiWebProvider implements AIProvider {
     account: GeminiAccount,
     rawUrl: string,
     targetSize = 2048,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<{ data: Buffer; mimeType: string }> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
     const session = await this.getOrFetchSession(account);
     let imageUrl = rawUrl;
     if (!imageUrl.includes('=s') && !imageUrl.includes('=w')) {
@@ -1510,7 +1534,7 @@ export class GeminiWebProvider implements AIProvider {
         'Cookie': session.cookieHeader,
       },
       dispatcher,
-    } as any, config.requestTimeout || 60000, signal);
+    } as any, getRemainingTimeout(opDeadline, 'Image download headers'), signal);
 
     if (!res.ok && (res.status === 403 || res.status === 401)) {
       // Retry without Cookie header as Google User Content CDN often rejects session cookies
@@ -1520,7 +1544,7 @@ export class GeminiWebProvider implements AIProvider {
           'Referer': 'https://gemini.google.com/',
         },
         dispatcher,
-      } as any, config.requestTimeout || 60000, signal);
+      } as any, getRemainingTimeout(opDeadline, 'Image download retry headers'), signal);
     }
 
     if (!res.ok) {
@@ -1528,7 +1552,7 @@ export class GeminiWebProvider implements AIProvider {
     }
 
     const mimeType = res.headers.get('content-type') || 'image/png';
-    const arrayBuffer = await readBufferWithTimeout(res, config.requestTimeout || 60000, signal);
+    const arrayBuffer = await readBufferWithTimeout(res, getRemainingTimeout(opDeadline, 'Image download read buffer'), signal);
     return { data: Buffer.from(arrayBuffer), mimeType };
   }
 
@@ -1551,7 +1575,8 @@ export class GeminiWebProvider implements AIProvider {
   private async executeRpc(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<{ res: Response; model: DiscoveredModel; images?: GeneratedMedia[] }> {
     const session = await this.getOrFetchSession(account);
     const resolvedModel = resolveGeminiModel(request.model, session.discoveredModels);
@@ -1563,22 +1588,7 @@ export class GeminiWebProvider implements AIProvider {
 
     let { prompt, attachments } = this.buildPromptAndAttachments(request.messages, hasNativeConversation);
 
-    // Support OpenAI response_format json_object if requested
-    if (request.response_format?.type === 'json_object') {
-      prompt += '\n\nIMPORTANT: Respond ONLY with valid JSON. Do not include markdown formatting or explanations.';
-    }
-
-    const uploadedFiles: UploadedFileRef[] = request.uploaded_files ? [...request.uploaded_files] : [];
-
-    // Upload inline attachments upstream
-    for (const att of attachments) {
-      const uploaded = await this.uploadFile(account, att.name, att.mimeType, att.data);
-      uploadedFiles.push(uploaded);
-    }
-
-    const requestId = crypto.randomUUID().toUpperCase();
     const isTemporary = false;
-
     const metadata = hasNativeConversation
       ? {
           cid: nativeCid,
@@ -1587,11 +1597,35 @@ export class GeminiWebProvider implements AIProvider {
         }
       : undefined;
 
+    // Attach uploaded files if present in request
+    let uploadedFiles: UploadedFileRef[] | undefined;
+    if (request.uploaded_files && request.uploaded_files.length > 0) {
+      uploadedFiles = request.uploaded_files.map((f) => ({
+        id: f.id,
+        name: f.name || 'file',
+      }));
+    }
+
+    const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+
     const wantsThinking =
       request.thinking === true ||
       request.model.toLowerCase().includes('thinking') ||
       (Boolean(request.reasoning_effort) && request.reasoning_effort !== 'none');
     const thinkingMode = wantsThinking ? 2 : 1;
+
+    // Support OpenAI response_format json_object if requested
+    if (request.response_format?.type === 'json_object') {
+      prompt += '\n\nIMPORTANT: Respond ONLY with valid JSON. Do not include markdown formatting or explanations.';
+    }
+
+    const uploadedFilesList: UploadedFileRef[] = uploadedFiles ? [...uploadedFiles] : [];
+
+    // Upload inline attachments upstream
+    for (const att of attachments) {
+      const uploaded = await this.uploadFile(account, att.name, att.mimeType, att.data);
+      uploadedFilesList.push(uploaded);
+    }
 
     const innerReq = buildGenerateInner(
       prompt,
@@ -1600,7 +1634,7 @@ export class GeminiWebProvider implements AIProvider {
       requestId,
       isTemporary,
       metadata,
-      uploadedFiles,
+      uploadedFilesList,
       thinkingMode
     );
 
@@ -1641,6 +1675,8 @@ export class GeminiWebProvider implements AIProvider {
 
     const fetchStart = Date.now();
     const dispatcher = getDispatcherForProxy(account.proxy_url);
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    const remaining = getRemainingTimeout(opDeadline, 'RPC headers fetch');
     const res = await fetchWithTimeout(
       rpcUrl,
       {
@@ -1649,7 +1685,7 @@ export class GeminiWebProvider implements AIProvider {
         body: bodyParams.toString(),
         dispatcher,
       } as any,
-      config.requestTimeout || 60000,
+      remaining,
       signal
     );
 
@@ -1672,10 +1708,13 @@ export class GeminiWebProvider implements AIProvider {
   public async ChatCompletion(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<AIProviderResult> {
-    const { res } = await this.executeRpc(account, request, signal);
-    const textBody = await readBodyWithTimeout(res, config.requestTimeout || 60000, signal);
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    const { res } = await this.executeRpc(account, request, signal, opDeadline);
+    const remaining = getRemainingTimeout(opDeadline, 'Response body read');
+    const textBody = await readBodyWithTimeout(res, remaining, signal);
     const parsed = parseGoogleWireResponse(textBody);
 
     let text = parsed.text;
@@ -1718,10 +1757,12 @@ export class GeminiWebProvider implements AIProvider {
   public async *ChatCompletionStream(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): AsyncIterable<AIStreamChunk> {
     const streamStart = performance.now();
-    const { res } = await this.executeRpc(account, request, signal);
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
+    const { res } = await this.executeRpc(account, request, signal, opDeadline);
 
     if (!res.body) {
       throw new Error('UPSTREAM_ERROR: Gemini Web response has no readable body stream');
@@ -1746,31 +1787,33 @@ export class GeminiWebProvider implements AIProvider {
       stopList = (Array.isArray(request.stop) ? request.stop : [request.stop]).filter(Boolean);
     }
 
-    const streamTimeoutMs = config.requestTimeout || 60000;
-    const streamDeadline = Date.now() + streamTimeoutMs;
-
     try {
       while (true) {
         if (signal?.aborted) {
           await reader.cancel().catch(() => {});
           throw new Error('CLIENT_ABORT: Request cancelled by client');
         }
-        if (Date.now() > streamDeadline) {
+        if (Date.now() >= opDeadline) {
           await reader.cancel().catch(() => {});
-          throw new Error(`UPSTREAM_TIMEOUT: Upstream streaming timed out after ${streamTimeoutMs}ms`);
+          throw new Error('UPSTREAM_TIMEOUT: Upstream streaming deadline exceeded');
         }
         if (hitStop) {
           await reader.cancel().catch(() => {});
           break;
         }
 
-        const remainingMs = Math.max(1000, streamDeadline - Date.now());
+        const remainingMs = opDeadline - Date.now();
+        if (remainingMs <= 0) {
+          await reader.cancel().catch(() => {});
+          throw new Error('UPSTREAM_TIMEOUT: Upstream streaming deadline exceeded');
+        }
+
         let readTimer: NodeJS.Timeout | null = null;
         let onClientAbort: (() => void) | null = null;
 
         const readTimeoutPromise = new Promise<never>((_, reject) => {
           readTimer = setTimeout(() => {
-            reject(new Error(`UPSTREAM_TIMEOUT: Upstream streaming chunk read timed out after ${streamTimeoutMs}ms`));
+            reject(new Error('UPSTREAM_TIMEOUT: Upstream streaming chunk read timed out'));
           }, remainingMs);
         });
 
@@ -1975,7 +2018,8 @@ export class GeminiWebProvider implements AIProvider {
     };
   }
 
-  public async fetchRecentConversations(account: GeminiAccount, limit = 10): Promise<UpstreamConversation[]> {
+  public async fetchRecentConversations(account: GeminiAccount, limit = 10, deadline?: number): Promise<UpstreamConversation[]> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
     const session = await this.getOrFetchSession(account);
 
     const query = new URLSearchParams({
@@ -2014,7 +2058,7 @@ export class GeminiWebProvider implements AIProvider {
       },
       body: form.toString(),
       dispatcher,
-    } as any);
+    } as any, getRemainingTimeout(opDeadline, 'Recent conversations headers'));
 
     console.log(`[Upstream Gemini Web ListConversations] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -2026,14 +2070,16 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch recent conversations: HTTP ${res.status}`);
     }
 
-    const text = await readBodyWithTimeout(res, config.requestTimeout || 60000);
+    const text = await readBodyWithTimeout(res, getRemainingTimeout(opDeadline, 'Recent conversations body'));
     return parseGeminiRecentConversations(text);
   }
 
   public async fetchConversationHistory(
     account: GeminiAccount,
-    conversationId: string
+    conversationId: string,
+    deadline?: number
   ): Promise<{ turns: UpstreamChatTurn[]; lastRid?: string; lastRcid?: string }> {
+    const opDeadline = deadline ?? (Date.now() + (config.requestTimeout || 60000));
     const session = await this.getOrFetchSession(account);
 
     const query = new URLSearchParams({
@@ -2072,7 +2118,7 @@ export class GeminiWebProvider implements AIProvider {
       },
       body: form.toString(),
       dispatcher,
-    } as any, config.requestTimeout || 60000);
+    } as any, getRemainingTimeout(opDeadline, 'Conversation history headers'));
 
     console.log(`[Upstream Gemini Web ReadConversation] account_id=${account.id} upstream_hostname=gemini.google.com upstream_path=/_/BardChatUi/data/batchexecute upstream_status=${res.status} duration_ms=${Date.now() - fetchStart}`);
 
@@ -2084,7 +2130,7 @@ export class GeminiWebProvider implements AIProvider {
       throw new Error(`Failed to fetch conversation history: HTTP ${res.status}`);
     }
 
-    const text = await readBodyWithTimeout(res, config.requestTimeout || 60000);
+    const text = await readBodyWithTimeout(res, getRemainingTimeout(opDeadline, 'Conversation history body'));
     return parseGeminiConversationHistory(text);
   }
 }

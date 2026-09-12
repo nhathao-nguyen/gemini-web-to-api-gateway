@@ -12,6 +12,9 @@ import { redactString } from '../utils/redact.js';
 import { accountScheduler } from '../services/scheduler.js';
 import { geminiProvider } from '../services/gemini-adapter/index.js';
 import { ramMediaCache } from '../services/ram-media-cache.js';
+import { db } from '../db/database.js';
+import { quotaManager } from '../services/quota-manager.js';
+import { GeminiAccount } from '../types.js';
 
 export const openaiRouter = Router();
 
@@ -75,15 +78,14 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
   const requestId = `req_${crypto.randomBytes(8).toString('hex')}`;
   res.setHeader('x-request-id', requestId);
 
-  // Client disconnect / abort handler
+  // Client disconnect / abort handler: reliably track response connection close
   const abortController = new AbortController();
-  const onDisconnect = () => {
-    if (!abortController.signal.aborted) {
+  const onClose = () => {
+    if (!res.writableEnded && !abortController.signal.aborted) {
       abortController.abort();
     }
   };
-  req.on('close', onDisconnect);
-  res.on('close', onDisconnect);
+  res.on('close', onClose);
 
   try {
     const parseResult = ChatCompletionRequestSchema.safeParse(req.body);
@@ -148,28 +150,39 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
       return res.json(response);
     }
   } catch (err: any) {
+    if (res.writableEnded || res.destroyed || abortController.signal.aborted) {
+      // Socket closed or aborted by client - do not attempt to write response
+      return;
+    }
+
     const errMsg = redactString(err.message || String(err));
     let statusCode = 500;
     let errCode = 'upstream_error';
 
-    if (errMsg.includes('MODEL_NOT_ALLOWED')) {
-      statusCode = 403;
-      errCode = 'model_not_available';
-    } else if (
-      errMsg.includes('INVALID_REQUEST') ||
-      errMsg.includes('FILE_ACCOUNT_MISMATCH') ||
-      errMsg.includes('FILE_NOT_FOUND_OR_EXPIRED') ||
-      errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE')
-    ) {
-      statusCode = 400;
-      errCode = errMsg.includes('FILE_NOT_FOUND_OR_EXPIRED')
-        ? 'file_not_found_or_expired'
-        : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE')
-        ? 'conversation_account_unavailable'
-        : 'invalid_request_error';
+    if (errMsg.includes('CLIENT_ABORT') || errMsg.includes('AbortError')) {
+      statusCode = 499;
+      errCode = 'client_abort';
+    } else if (errMsg.includes('UPSTREAM_TIMEOUT')) {
+      statusCode = 504;
+      errCode = 'upstream_timeout';
+    } else if (errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE')) {
+      statusCode = 503;
+      errCode = 'conversation_account_unavailable';
     } else if (errMsg.includes('NO_HEALTHY_ACCOUNTS')) {
       statusCode = 503;
       errCode = 'no_healthy_accounts';
+    } else if (errMsg.includes('MODEL_NOT_ALLOWED')) {
+      statusCode = 403;
+      errCode = 'model_not_available';
+    } else if (errMsg.includes('FILE_NOT_FOUND_OR_EXPIRED')) {
+      statusCode = 400;
+      errCode = 'file_not_found_or_expired';
+    } else if (errMsg.includes('FILE_ACCOUNT_MISMATCH')) {
+      statusCode = 400;
+      errCode = 'file_account_mismatch';
+    } else if (errMsg.includes('INVALID_REQUEST')) {
+      statusCode = 400;
+      errCode = 'invalid_request_error';
     } else if (errMsg.includes('SESSION_EXPIRED')) {
       statusCode = 502;
       errCode = 'upstream_auth_expired';
@@ -178,8 +191,11 @@ openaiRouter.post('/chat/completions', authMiddleware, async (req: Request, res:
       errCode = 'upstream_quota_exhausted';
     }
 
-    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode, 'gateway_error'));
+    if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+      return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errCode, 'gateway_error'));
+    }
   } finally {
+    res.removeListener('close', onClose);
     await rateLimiter.release(apiKey.id);
   }
 });
@@ -206,7 +222,10 @@ openaiRouter.post('/images/generations', authMiddleware, async (req: Request, re
     let statusCode = 500;
     let errCode = 'image_generation_failed';
 
-    if (errMsg.includes('MODEL_NOT_ALLOWED')) {
+    if (errMsg.includes('UPSTREAM_TIMEOUT')) {
+      statusCode = 504;
+      errCode = 'upstream_timeout';
+    } else if (errMsg.includes('MODEL_NOT_ALLOWED')) {
       statusCode = 403;
       errCode = 'model_not_available';
     } else if (errMsg.includes('NO_HEALTHY_ACCOUNTS')) {
@@ -295,7 +314,18 @@ openaiRouter.post('/files', authMiddleware, async (req: Request, res: Response) 
 // GET /v1/conversations/upstream-recent
 openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: Request, res: Response) => {
   const apiKey = (req as any).gatewayApiKey;
-  const targetAccount = accountScheduler.selectAnyActiveAccount();
+  const explicitAccountId = req.query.account_id as string | undefined;
+
+  let targetAccount: GeminiAccount | null = null;
+  if (explicitAccountId) {
+    const acc = db.getAccountById(explicitAccountId);
+    if (acc && acc.status === 'ACTIVE' && !quotaManager.isCoolingDown(acc)) {
+      targetAccount = acc;
+    }
+  }
+  if (!targetAccount) {
+    targetAccount = accountScheduler.selectAnyActiveAccount();
+  }
 
   if (!targetAccount) {
     await rateLimiter.release(apiKey.id);
@@ -315,10 +345,16 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
 
     return res.json({
       object: 'list',
-      data: conversations,
+      account_id: targetAccount.id,
+      data: conversations.map((c) => ({
+        ...c,
+        account_id: targetAccount.id,
+      })),
     });
   } catch (err: any) {
-    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to fetch upstream conversations', 'upstream_error'));
+    const errMsg = redactString(err.message || 'Failed to fetch upstream conversations');
+    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
+    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error'));
   } finally {
     await rateLimiter.release(apiKey.id);
   }
@@ -327,7 +363,44 @@ openaiRouter.get('/conversations/upstream-recent', authMiddleware, async (req: R
 // GET /v1/conversations/upstream/:cid/turns
 openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (req: Request, res: Response) => {
   const apiKey = (req as any).gatewayApiKey;
-  const targetAccount = accountScheduler.selectAnyActiveAccount();
+  const cid = req.params.cid;
+  const explicitAccountId = req.query.account_id as string | undefined;
+
+  let targetAccount: GeminiAccount | null = null;
+  const affinityAccountId = accountScheduler.getConversationAffinity(cid);
+
+  if (affinityAccountId) {
+    // Priority 1: RAM conversation affinity
+    const acc = db.getAccountById(affinityAccountId);
+    if (!acc || acc.status !== 'ACTIVE' || quotaManager.isCoolingDown(acc)) {
+      await rateLimiter.release(apiKey.id);
+      return res.status(503).json(
+        OpenAIAdapter.formatError(
+          `CONVERSATION_ACCOUNT_UNAVAILABLE: The Gemini account (${affinityAccountId}) associated with conversation "${cid}" is inactive or unavailable`,
+          'conversation_account_unavailable',
+          'upstream_error'
+        )
+      );
+    }
+    targetAccount = acc;
+  } else if (explicitAccountId) {
+    // Priority 2: Explicit account_id
+    const acc = db.getAccountById(explicitAccountId);
+    if (!acc || acc.status !== 'ACTIVE' || quotaManager.isCoolingDown(acc)) {
+      await rateLimiter.release(apiKey.id);
+      return res.status(503).json(
+        OpenAIAdapter.formatError(
+          `CONVERSATION_ACCOUNT_UNAVAILABLE: The Gemini account (${explicitAccountId}) specified for conversation "${cid}" is inactive or unavailable`,
+          'conversation_account_unavailable',
+          'upstream_error'
+        )
+      );
+    }
+    targetAccount = acc;
+  } else {
+    // Priority 3: Fallback active account selection
+    targetAccount = accountScheduler.selectAnyActiveAccount();
+  }
 
   if (!targetAccount) {
     await rateLimiter.release(apiKey.id);
@@ -335,18 +408,21 @@ openaiRouter.get('/conversations/upstream/:cid/turns', authMiddleware, async (re
   }
 
   try {
-    const data = await geminiProvider.fetchConversationHistory(targetAccount, req.params.cid);
-    // Register RAM affinity for this conversation
-    accountScheduler.setConversationAffinity(req.params.cid, targetAccount.id);
+    const data = await geminiProvider.fetchConversationHistory(targetAccount, cid);
+    // Refresh/set RAM affinity for this conversation
+    accountScheduler.setConversationAffinity(cid, targetAccount.id);
 
     return res.json({
-      conversation_id: req.params.cid,
+      conversation_id: cid,
+      account_id: targetAccount.id,
       turns: data.turns,
       last_rid: data.lastRid,
       last_rcid: data.lastRcid,
     });
   } catch (err: any) {
-    return res.status(500).json(OpenAIAdapter.formatError(err.message || 'Failed to fetch upstream conversation turns', 'upstream_error'));
+    const errMsg = redactString(err.message || 'Failed to fetch upstream conversation turns');
+    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
+    return res.status(statusCode).json(OpenAIAdapter.formatError(errMsg, errMsg.includes('UPSTREAM_TIMEOUT') ? 'upstream_timeout' : 'upstream_error'));
   } finally {
     await rateLimiter.release(apiKey.id);
   }

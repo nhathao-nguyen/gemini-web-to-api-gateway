@@ -21,36 +21,40 @@ export class GeminiProviderRouter implements AIProvider {
   public async ChatCompletion(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<AIProviderResult> {
-    return this.webProvider.ChatCompletion(account, request, signal);
+    return this.webProvider.ChatCompletion(account, request, signal, deadline);
   }
 
   public ChatCompletionStream(
     account: GeminiAccount,
     request: ChatCompletionRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): AsyncIterable<AIStreamChunk> {
-    return this.webProvider.ChatCompletionStream(account, request, signal);
+    return this.webProvider.ChatCompletionStream(account, request, signal, deadline);
   }
 
   public async uploadFile(
-
     account: GeminiAccount,
     filename: string,
     mimeType: string,
-    data: Buffer
+    data: Buffer,
+    signal?: AbortSignal,
+    deadline?: number
   ) {
-    return this.webProvider.uploadFile(account, filename, mimeType, data);
+    return this.webProvider.uploadFile(account, filename, mimeType, data, signal, deadline);
   }
 
   public async downloadGeneratedImage(
     account: GeminiAccount,
     rawUrl: string,
     targetSize?: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ) {
-    return this.webProvider.downloadGeneratedImage(account, rawUrl, targetSize, signal);
+    return this.webProvider.downloadGeneratedImage(account, rawUrl, targetSize, signal, deadline);
   }
 
   public getModelCapabilities(modelId: string) {
@@ -61,12 +65,12 @@ export class GeminiProviderRouter implements AIProvider {
     return this.webProvider.fetchAccountQuota(account);
   }
 
-  public async fetchRecentConversations(account: GeminiAccount, limit = 10) {
-    return this.webProvider.fetchRecentConversations(account, limit);
+  public async fetchRecentConversations(account: GeminiAccount, limit = 10, deadline?: number) {
+    return this.webProvider.fetchRecentConversations(account, limit, deadline);
   }
 
-  public async fetchConversationHistory(account: GeminiAccount, conversationId: string) {
-    return this.webProvider.fetchConversationHistory(account, conversationId);
+  public async fetchConversationHistory(account: GeminiAccount, conversationId: string, deadline?: number) {
+    return this.webProvider.fetchConversationHistory(account, conversationId, deadline);
   }
 }
 

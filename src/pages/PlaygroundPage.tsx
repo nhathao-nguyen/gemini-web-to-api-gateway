@@ -177,7 +177,8 @@ export const PlaygroundPage: React.FC = () => {
     setLoadingTurns(true);
     setErrorText(null);
     try {
-      const data = await fetchUpstreamConversationTurns(conv.id);
+      const targetAccId = conv.account_id || recentConvsData?.account_id;
+      const data = await fetchUpstreamConversationTurns(conv.id, targetAccId);
       if (data.turns && data.turns.length > 0) {
         const mappedTurns: ChatTurn[] = data.turns.map((t, idx) => ({
           id: `loaded_${idx}_${Date.now()}`,

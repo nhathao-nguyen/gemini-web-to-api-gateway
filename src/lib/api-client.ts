@@ -424,6 +424,7 @@ export interface UpstreamConversationItem {
   id: string; // c_...
   title: string;
   updated_at: string;
+  account_id?: string;
   timestamp_seconds?: number;
   choice_id?: string;
 }
@@ -450,14 +451,15 @@ export async function fetchUpstreamRecentConversations(limit = 10): Promise<{
   return res.json();
 }
 
-export async function fetchUpstreamConversationTurns(cid: string): Promise<{
+export async function fetchUpstreamConversationTurns(cid: string, accountId?: string): Promise<{
   conversation_id: string;
   account_id: string;
   turns: UpstreamTurnItem[];
   last_rid?: string;
   last_rcid?: string;
 }> {
-  const res = await adminFetch(`/api/admin/conversations/upstream/${encodeURIComponent(cid)}/turns`);
+  const query = accountId ? `?account_id=${encodeURIComponent(accountId)}` : '';
+  const res = await adminFetch(`/api/admin/conversations/upstream/${encodeURIComponent(cid)}/turns${query}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `HTTP ${res.status}`);

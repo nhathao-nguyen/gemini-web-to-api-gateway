@@ -7,14 +7,25 @@ export interface CachedMediaItem {
 export class RamMediaCache {
   private cache = new Map<string, CachedMediaItem>();
   private maxItems: number;
+  private maxItemBytes: number;
+  private maxTotalBytes: number;
+  private currentBytes = 0;
   private defaultTtlMs: number;
   private cleanupInterval: NodeJS.Timeout | null = null;
 
-  constructor(options?: { maxItems?: number; defaultTtlMs?: number }) {
+  constructor(options?: {
+    maxItems?: number;
+    maxItemBytes?: number;
+    maxTotalBytes?: number;
+    defaultTtlMs?: number;
+  }) {
     this.maxItems = options?.maxItems || 200;
+    // Default safe LAN bounds: 20MB per item, 256MB total in RAM
+    this.maxItemBytes = options?.maxItemBytes || 20 * 1024 * 1024;
+    this.maxTotalBytes = options?.maxTotalBytes || 256 * 1024 * 1024;
     this.defaultTtlMs = options?.defaultTtlMs || 2 * 60 * 60 * 1000; // 2 hours
 
-    // Run cleanup every 10 minutes
+    // Run cleanup periodically
     this.cleanupInterval = setInterval(() => {
       this.cleanup();
     }, 10 * 60 * 1000);
@@ -26,17 +37,46 @@ export class RamMediaCache {
     buffer: Buffer,
     mimeType: string = 'image/png',
     ttlMs: number = this.defaultTtlMs
-  ): void {
-    // If over capacity, prune expired first
-    if (this.cache.size >= this.maxItems) {
-      this.cleanup();
-      // If still over capacity, remove oldest entry (FIFO)
-      if (this.cache.size >= this.maxItems) {
-        const oldestKey = this.cache.keys().next().value;
-        if (oldestKey) {
-          this.cache.delete(oldestKey);
-        }
+  ): boolean {
+    if (!id || !buffer) return false;
+
+    // 1. Enforce maxItemBytes
+    if (buffer.length > this.maxItemBytes) {
+      return false;
+    }
+
+    // 2. Prune expired entries first
+    this.cleanup();
+
+    // 3. If item already exists, deduct previous bytes
+    const existing = this.cache.get(id);
+    if (existing) {
+      this.currentBytes = Math.max(0, this.currentBytes - existing.buffer.length);
+      this.cache.delete(id);
+    }
+
+    // 4. If single item exceeds total capacity, cannot cache
+    if (buffer.length > this.maxTotalBytes) {
+      return false;
+    }
+
+    // 5. Evict FIFO until enough space and below maxItems
+    while (
+      (this.currentBytes + buffer.length > this.maxTotalBytes || this.cache.size >= this.maxItems) &&
+      this.cache.size > 0
+    ) {
+      const oldestKey = this.cache.keys().next().value;
+      if (!oldestKey) break;
+      const oldestItem = this.cache.get(oldestKey);
+      if (oldestItem) {
+        this.currentBytes = Math.max(0, this.currentBytes - oldestItem.buffer.length);
       }
+      this.cache.delete(oldestKey);
+    }
+
+    // Double-check space after eviction
+    if (this.currentBytes + buffer.length > this.maxTotalBytes) {
+      return false;
     }
 
     this.cache.set(id, {
@@ -44,6 +84,8 @@ export class RamMediaCache {
       mimeType,
       expiresAt: Date.now() + ttlMs,
     });
+    this.currentBytes += buffer.length;
+    return true;
   }
 
   public getMedia(id: string): { buffer: Buffer; mimeType: string } | null {
@@ -51,6 +93,7 @@ export class RamMediaCache {
     if (!item) return null;
 
     if (Date.now() > item.expiresAt) {
+      this.currentBytes = Math.max(0, this.currentBytes - item.buffer.length);
       this.cache.delete(id);
       return null;
     }
@@ -62,6 +105,9 @@ export class RamMediaCache {
   }
 
   public deleteMedia(id: string): boolean {
+    const item = this.cache.get(id);
+    if (!item) return false;
+    this.currentBytes = Math.max(0, this.currentBytes - item.buffer.length);
     return this.cache.delete(id);
   }
 
@@ -69,6 +115,7 @@ export class RamMediaCache {
     const now = Date.now();
     for (const [key, item] of this.cache.entries()) {
       if (now > item.expiresAt) {
+        this.currentBytes = Math.max(0, this.currentBytes - item.buffer.length);
         this.cache.delete(key);
       }
     }
@@ -76,10 +123,33 @@ export class RamMediaCache {
 
   public clear(): void {
     this.cache.clear();
+    this.currentBytes = 0;
   }
 
   public size(): number {
     return this.cache.size;
+  }
+
+  public getCurrentBytes(): number {
+    return this.currentBytes;
+  }
+
+  public getMaxItemBytes(): number {
+    return this.maxItemBytes;
+  }
+
+  public getMaxTotalBytes(): number {
+    return this.maxTotalBytes;
+  }
+
+  public getStats() {
+    return {
+      items: this.cache.size,
+      currentBytes: this.currentBytes,
+      maxItems: this.maxItems,
+      maxItemBytes: this.maxItemBytes,
+      maxTotalBytes: this.maxTotalBytes,
+    };
   }
 }
 

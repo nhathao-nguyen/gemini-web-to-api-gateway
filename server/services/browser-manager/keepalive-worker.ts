@@ -252,13 +252,13 @@ export class KeepAliveWorker {
       // 3. Check for auth redirect
       if (isGoogleLoginUrl(finalUrl)) {
         console.warn(`[KeepAliveWorker] Account ${account.name} session has expired (Redirected to Google Login).`);
-        geminiProvider.invalidateSession(accountId);
         db.updateAccount(accountId, {
           status: 'SESSION_EXPIRED',
           keepalive_status: 'FAILED',
           last_error: 'Google session expired: Redirected to login page during keep-alive.',
           last_error_at: new Date().toISOString(),
         });
+        geminiProvider.invalidateSession(accountId);
 
         db.addAccountEvent({
           id: `evt_${crypto.randomBytes(8).toString('hex')}`,
@@ -347,8 +347,6 @@ export class KeepAliveWorker {
       const nowStr = new Date().toISOString();
 
 
-      geminiProvider.invalidateSession(accountId);
-
       db.updateAccount(accountId, {
         status: account.status === 'SESSION_EXPIRED' ? 'ACTIVE' : account.status,
         encrypted_cookie: encryptedCookie,
@@ -358,6 +356,8 @@ export class KeepAliveWorker {
         consecutive_errors: 0,
         last_error: null,
       });
+
+      geminiProvider.invalidateSession(accountId);
 
       db.addAccountEvent({
         id: `evt_${crypto.randomBytes(8).toString('hex')}`,
@@ -382,16 +382,16 @@ export class KeepAliveWorker {
       const nowStr = new Date().toISOString();
       const isSessionExpired = String(err.message || '').includes('SESSION_EXPIRED');
 
-      if (isSessionExpired) {
-        geminiProvider.invalidateSession(accountId);
-      }
-
       db.updateAccount(accountId, {
         ...(isSessionExpired ? { status: 'SESSION_EXPIRED' as const } : {}),
         keepalive_status: 'FAILED',
         last_error: `Keep-alive error: ${err.message}`,
         last_error_at: nowStr,
       });
+
+      if (isSessionExpired) {
+        geminiProvider.invalidateSession(accountId);
+      }
 
       db.addAccountEvent({
         id: `evt_${crypto.randomBytes(8).toString('hex')}`,

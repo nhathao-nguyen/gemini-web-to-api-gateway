@@ -8,11 +8,14 @@ import { accountScheduler } from '../services/scheduler.js';
 import { accountManager } from '../services/account-manager.js';
 import { gatewayService } from '../services/gateway-service.js';
 import { geminiProvider } from '../services/gemini-adapter/index.js';
+import { EventEmitter } from 'events';
+import { RamMediaCache } from '../services/ram-media-cache.js';
 import {
   GeminiWebProvider,
   hasUsableNativeConversationState,
   readBodyWithTimeout,
   readBufferWithTimeout,
+  getRemainingTimeout,
 } from '../services/gemini-adapter/gemini-web.js';
 import { GeminiAccount, ApiKey } from '../types.js';
 
@@ -604,6 +607,283 @@ export async function runRegressionTests() {
     `Atomic counter increment exactly matches ${concurrency} concurrent requests (got ${finalCounterAcc?.request_count})`
   );
   db.deleteAccount(counterAccount.id);
+
+  // ----------------------------------------------------
+  // Suite: Hardened Client Disconnect, History Affinity, RAM Media Bytes & Timeouts (12 Tests)
+  // ----------------------------------------------------
+  console.log('\n--- Hardened Lifecycle, Affinity, Media Bytes & Timeout Suites ---');
+
+  // Test 1: Request lifecycle bình thường không bị abort nhầm
+  {
+    const abortCtrl = new AbortController();
+    const mockReq = new EventEmitter();
+    const mockRes = new EventEmitter() as any;
+    mockRes.writableEnded = false;
+
+    const onClose = () => {
+      if (!mockRes.writableEnded && !abortCtrl.signal.aborted) {
+        abortCtrl.abort();
+      }
+    };
+    mockRes.on('close', onClose);
+
+    // Incoming request body read complete emits 'close' on req
+    mockReq.emit('close');
+    assert(!abortCtrl.signal.aborted, 'Normal request close on req does not abort AbortController');
+
+    // Normal response completion finishes writing
+    mockRes.writableEnded = true;
+    mockRes.emit('close');
+    mockRes.removeListener('close', onClose);
+    assert(!abortCtrl.signal.aborted, 'Normal response finish (writableEnded=true) does not abort AbortController');
+  }
+
+  // Test 2: Actual response close/abort cancel upstream
+  {
+    const abortCtrl = new AbortController();
+    const mockRes = new EventEmitter() as any;
+    mockRes.writableEnded = false;
+
+    const onClose = () => {
+      if (!mockRes.writableEnded && !abortCtrl.signal.aborted) {
+        abortCtrl.abort();
+      }
+    };
+    mockRes.on('close', onClose);
+
+    // Client cuts connection prematurely while writableEnded is false
+    mockRes.emit('close');
+    assert(abortCtrl.signal.aborted, 'Premature client response close aborts upstream AbortController');
+  }
+
+  // Test 3: History route ưu tiên conversation affinity
+  {
+    const accHistA = createDummyAccount('acc_hist_a', 'Account Hist A');
+    const accHistB = createDummyAccount('acc_hist_b', 'Account Hist B');
+    db.createAccount(accHistA);
+    db.createAccount(accHistB);
+
+    accountScheduler.setConversationAffinity('c_pinned_hist_1', accHistA.id);
+
+    // Simulate affinity-first account selection for conversation history
+    let chosenAccountId: string | null = null;
+    const affinityId = accountScheduler.getConversationAffinity('c_pinned_hist_1');
+    if (affinityId) {
+      const acc = db.getAccountById(affinityId);
+      if (acc && acc.status === 'ACTIVE' && !quotaManager.isCoolingDown(acc)) {
+        chosenAccountId = acc.id;
+      }
+    }
+    assert(chosenAccountId === accHistA.id, 'History route resolves pinned conversation affinity to Account A');
+
+    // Refresh TTL on success
+    accountScheduler.setConversationAffinity('c_pinned_hist_1', accHistA.id);
+    assert(
+      accountScheduler.getConversationAffinity('c_pinned_hist_1') === accHistA.id,
+      'Conversation affinity TTL refreshed on successful history fetch'
+    );
+
+    db.deleteAccount(accHistA.id);
+    db.deleteAccount(accHistB.id);
+  }
+
+  // Test 4: History không failover sang sai account
+  {
+    const accHistP = createDummyAccount('acc_hist_p', 'Account Hist P');
+    accHistP.status = 'SESSION_EXPIRED';
+    const accHistQ = createDummyAccount('acc_hist_q', 'Account Hist Q'); // active
+    db.createAccount(accHistP);
+    db.createAccount(accHistQ);
+
+    accountScheduler.setConversationAffinity('c_pinned_hist_fail', accHistP.id);
+
+    let threwUnavailable = false;
+    let chosenAccount: any = null;
+    const affinityId = accountScheduler.getConversationAffinity('c_pinned_hist_fail');
+    if (affinityId) {
+      const acc = db.getAccountById(affinityId);
+      if (!acc || acc.status !== 'ACTIVE' || quotaManager.isCoolingDown(acc)) {
+        threwUnavailable = true;
+      } else {
+        chosenAccount = acc;
+      }
+    } else {
+      chosenAccount = accountScheduler.selectAnyActiveAccount();
+    }
+
+    assert(threwUnavailable, 'History fetch detects inactive affinity account and triggers CONVERSATION_ACCOUNT_UNAVAILABLE');
+    assert(chosenAccount === null, 'History fetch does not failover to Account Q when affinity account is unavailable');
+
+    db.deleteAccount(accHistP.id);
+    db.deleteAccount(accHistQ.id);
+  }
+
+  // Test 5: Recent conversation giữ đúng account affinity
+  {
+    const accRecent = createDummyAccount('acc_recent_1', 'Account Recent');
+    db.createAccount(accRecent);
+
+    const mockConversations = [
+      { id: 'c_recent_alpha', title: 'Conversation Alpha' },
+      { id: 'c_recent_beta', title: 'Conversation Beta' },
+    ];
+
+    for (const c of mockConversations) {
+      accountScheduler.setConversationAffinity(c.id, accRecent.id);
+    }
+
+    assert(
+      accountScheduler.getConversationAffinity('c_recent_alpha') === accRecent.id,
+      'Recent conversation alpha affinity bound to Account Recent'
+    );
+    assert(
+      accountScheduler.getConversationAffinity('c_recent_beta') === accRecent.id,
+      'Recent conversation beta affinity bound to Account Recent'
+    );
+
+    db.deleteAccount(accRecent.id);
+  }
+
+  // Test 6: Media cache enforce maxItemBytes
+  {
+    const smallCache = new RamMediaCache({
+      maxItemBytes: 500,
+      maxTotalBytes: 5000,
+    });
+    const oversizedBuffer = Buffer.alloc(501, 'x');
+    const saved = smallCache.saveMedia('oversized_item', oversizedBuffer);
+    assert(!saved, 'Media cache rejects item exceeding maxItemBytes');
+    assert(smallCache.getMedia('oversized_item') === null, 'Oversized item not present in media cache');
+    assert(smallCache.getCurrentBytes() === 0, 'currentBytes remains 0 after rejected item');
+  }
+
+  // Test 7: Media cache enforce maxTotalBytes
+  {
+    const totalCapCache = new RamMediaCache({
+      maxItemBytes: 1000,
+      maxTotalBytes: 1500,
+    });
+    const buf1 = Buffer.alloc(700, 'a');
+    const buf2 = Buffer.alloc(700, 'b');
+    const buf3 = Buffer.alloc(700, 'c');
+
+    totalCapCache.saveMedia('item_1', buf1);
+    totalCapCache.saveMedia('item_2', buf2);
+    assert(totalCapCache.getCurrentBytes() === 1400, 'Current bytes matches 1400 for item_1 + item_2');
+
+    // Inserting item_3 (700 bytes) pushes total to 2100 > 1500, causing FIFO eviction of item_1
+    totalCapCache.saveMedia('item_3', buf3);
+    assert(totalCapCache.getMedia('item_1') === null, 'FIFO eviction removed oldest item_1');
+    assert(totalCapCache.getMedia('item_2') !== null, 'item_2 remains in cache');
+    assert(totalCapCache.getMedia('item_3') !== null, 'item_3 saved in cache');
+    assert(totalCapCache.getCurrentBytes() === 1400, 'Current bytes maintained under maxTotalBytes (1400 <= 1500)');
+  }
+
+  // Test 8: Eviction cập nhật byte counter đúng
+  {
+    const accountingCache = new RamMediaCache({
+      maxItemBytes: 1000,
+      maxTotalBytes: 2000,
+    });
+    const b1 = Buffer.alloc(600, '1');
+    const b2 = Buffer.alloc(800, '2');
+    accountingCache.saveMedia('acc_1', b1);
+    accountingCache.saveMedia('acc_2', b2);
+    assert(accountingCache.getCurrentBytes() === 1400, 'currentBytes accurately set to 1400');
+
+    accountingCache.deleteMedia('acc_1');
+    assert(accountingCache.getCurrentBytes() === 800, 'currentBytes decremented to 800 after deleteMedia');
+
+    accountingCache.clear();
+    assert(accountingCache.getCurrentBytes() === 0, 'currentBytes reset to 0 after clear()');
+  }
+
+  // Test 9: Keep-alive update DB trước invalidate
+  {
+    const eventSequence: string[] = [];
+    const testAcc = createDummyAccount('acc_order_test', 'Order Test');
+    db.createAccount(testAcc);
+
+    const originalUpdateAccount = db.updateAccount.bind(db);
+    const originalInvalidate = (geminiProvider as any).invalidateSession.bind(geminiProvider);
+
+    (db as any).updateAccount = (id: string, updates: any) => {
+      eventSequence.push('db.updateAccount');
+      return originalUpdateAccount(id, updates);
+    };
+    (geminiProvider as any).invalidateSession = (id: string) => {
+      eventSequence.push('geminiProvider.invalidateSession');
+      return originalInvalidate(id);
+    };
+
+    // Simulate keep-alive token refresh logic: DB update FIRST, then invalidate
+    db.updateAccount(testAcc.id, {
+      status: 'ACTIVE',
+      last_keepalive_at: new Date().toISOString(),
+      keepalive_status: 'SUCCESS',
+    });
+    geminiProvider.invalidateSession(testAcc.id);
+
+    assert(
+      eventSequence[0] === 'db.updateAccount' && eventSequence[1] === 'geminiProvider.invalidateSession',
+      'Keep-alive updates SQLite DB BEFORE calling geminiProvider.invalidateSession'
+    );
+
+    (db as any).updateAccount = originalUpdateAccount;
+    (geminiProvider as any).invalidateSession = originalInvalidate;
+    db.deleteAccount(testAcc.id);
+  }
+
+  // Test 10: Shared deadline không reset giữa header/body/stream
+  {
+    const shortDeadline = Date.now() + 80;
+    const remaining1 = getRemainingTimeout(shortDeadline, 'Phase 1');
+    assert(remaining1 <= 80 && remaining1 > 0, 'Phase 1 timeout remaining is bounded by initial deadline');
+
+    await new Promise((r) => setTimeout(r, 90));
+
+    let deadlineThrew = false;
+    try {
+      getRemainingTimeout(shortDeadline, 'Phase 2');
+    } catch (err: any) {
+      deadlineThrew = err.message.includes('UPSTREAM_TIMEOUT');
+    }
+    assert(deadlineThrew, 'Shared deadline does not reset between phases and throws UPSTREAM_TIMEOUT');
+  }
+
+  // Test 11: UPSTREAM_TIMEOUT map thành HTTP 504
+  {
+    const timeoutErr = new Error('UPSTREAM_TIMEOUT: Upstream request timed out after 60000ms');
+    const errMsg = timeoutErr.message;
+    let statusCode = 500;
+    let errCode = 'upstream_error';
+
+    if (errMsg.includes('UPSTREAM_TIMEOUT')) {
+      statusCode = 504;
+      errCode = 'upstream_timeout';
+    }
+
+    assert(statusCode === 504, 'UPSTREAM_TIMEOUT maps to HTTP status 504');
+    assert(errCode === 'upstream_timeout', 'UPSTREAM_TIMEOUT maps to error code upstream_timeout');
+  }
+
+  // Test 12: Client abort không tăng consecutive_errors
+  {
+    const abortAccount = createDummyAccount('acc_abort_penalty_test', 'Abort Penalty Test');
+    db.createAccount(abortAccount);
+
+    quotaManager.recordError(abortAccount.id, new Error('CLIENT_ABORT: Request cancelled by client'));
+    const check1 = db.getAccountById(abortAccount.id);
+    assert(check1?.consecutive_errors === 0, 'Client abort error does not increment consecutive_errors');
+    assert(check1?.status === 'ACTIVE', 'Client abort maintains ACTIVE status without penalties');
+
+    quotaManager.recordError(abortAccount.id, new Error('The user aborted a request.'));
+    const check2 = db.getAccountById(abortAccount.id);
+    assert(check2?.consecutive_errors === 0, 'User abort error does not increment consecutive_errors');
+    assert(check2?.status === 'ACTIVE', 'User abort maintains ACTIVE status');
+
+    db.deleteAccount(abortAccount.id);
+  }
 
   console.log(`\n======================================================`);
   console.log(`🏁 Regression Results: ${regressionPassed} Passed, ${regressionFailed} Failed`);

@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { accountManager } from '../services/account-manager.js';
 import { apiKeyManager } from '../services/api-key-manager.js';
 import { accountScheduler } from '../services/scheduler.js';
+import { quotaManager } from '../services/quota-manager.js';
 import { usageService } from '../services/usage-service.js';
 import { db } from '../db/database.js';
 import { config } from '../config.js';
@@ -485,11 +486,11 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
   const accountId = req.query.account_id as string | undefined;
   const accounts = db.getAccounts();
   const targetAccount = accountId
-    ? accounts.find((a) => a.id === accountId)
-    : accounts.find((a) => a.status === 'ACTIVE') || accounts[0];
+    ? accounts.find((a) => a.id === accountId && a.status === 'ACTIVE' && !quotaManager.isCoolingDown(a))
+    : accountScheduler.selectAnyActiveAccount();
 
   if (!targetAccount) {
-    return res.status(503).json({ error: 'No active Gemini account found' });
+    return res.status(503).json({ error: 'No active Gemini account found', code: 'NO_HEALTHY_ACCOUNTS' });
   }
 
   try {
@@ -503,27 +504,57 @@ adminRouter.get('/conversations/upstream-recent', async (req: Request, res: Resp
     return res.json({
       account_id: targetAccount.id,
       account_name: targetAccount.name,
-      conversations,
+      conversations: conversations.map((c) => ({
+        ...c,
+        account_id: targetAccount.id,
+      })),
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Failed to fetch recent conversations' });
+    const errMsg = err.message || 'Failed to fetch recent conversations';
+    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : 500;
+    return res.status(statusCode).json({ error: errMsg, code: errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
   }
 });
 
 adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: Response) => {
   const cid = req.params.cid;
-  const accountId = req.query.account_id as string | undefined;
-  const accounts = db.getAccounts();
-  const targetAccount = accountId
-    ? accounts.find((a) => a.id === accountId)
-    : accounts.find((a) => a.status === 'ACTIVE') || accounts[0];
+  const explicitAccountId = req.query.account_id as string | undefined;
+
+  let targetAccount: import('../types.js').GeminiAccount | null = null;
+  const affinityAccountId = accountScheduler.getConversationAffinity(cid);
+
+  if (affinityAccountId) {
+    // Priority 1: RAM conversation affinity takes precedence
+    const acc = db.getAccountById(affinityAccountId);
+    if (!acc || acc.status !== 'ACTIVE' || quotaManager.isCoolingDown(acc)) {
+      return res.status(503).json({
+        error: `CONVERSATION_ACCOUNT_UNAVAILABLE: The Gemini account (${affinityAccountId}) associated with conversation "${cid}" is inactive or unavailable`,
+        code: 'CONVERSATION_ACCOUNT_UNAVAILABLE',
+      });
+    }
+    targetAccount = acc;
+  } else if (explicitAccountId) {
+    // Priority 2: Explicit account_id
+    const acc = db.getAccountById(explicitAccountId);
+    if (!acc || acc.status !== 'ACTIVE' || quotaManager.isCoolingDown(acc)) {
+      return res.status(503).json({
+        error: `CONVERSATION_ACCOUNT_UNAVAILABLE: The specified Gemini account (${explicitAccountId}) is inactive or unavailable`,
+        code: 'CONVERSATION_ACCOUNT_UNAVAILABLE',
+      });
+    }
+    targetAccount = acc;
+  } else {
+    // Priority 3: Fallback active account selection
+    targetAccount = accountScheduler.selectAnyActiveAccount();
+  }
 
   if (!targetAccount) {
-    return res.status(503).json({ error: 'No active Gemini account found' });
+    return res.status(503).json({ error: 'No active Gemini account found', code: 'NO_HEALTHY_ACCOUNTS' });
   }
 
   try {
     const data = await geminiProvider.fetchConversationHistory(targetAccount, cid);
+    // Refresh/set RAM affinity for this conversation
     accountScheduler.setConversationAffinity(cid, targetAccount.id);
     return res.json({
       conversation_id: cid,
@@ -533,7 +564,9 @@ adminRouter.get('/conversations/upstream/:cid/turns', async (req: Request, res: 
       last_rcid: data.lastRcid,
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Failed to fetch conversation history' });
+    const errMsg = err.message || 'Failed to fetch conversation history';
+    const statusCode = errMsg.includes('UPSTREAM_TIMEOUT') ? 504 : errMsg.includes('CONVERSATION_ACCOUNT_UNAVAILABLE') ? 503 : 500;
+    return res.status(statusCode).json({ error: errMsg, code: errMsg.includes('UPSTREAM_TIMEOUT') ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR' });
   }
 });
 

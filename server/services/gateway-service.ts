@@ -82,6 +82,7 @@ export class GatewayService {
 
     const excludedIds: string[] = [];
     const maxAttempts = config.maxUpstreamAttempts || 2;
+    const operationDeadline = Date.now() + (config.requestTimeout || 60000);
     let lastError: any = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -128,7 +129,7 @@ export class GatewayService {
       accountScheduler.incrementActive(targetAccount.id);
 
       try {
-        const result = await geminiProvider.ChatCompletion(targetAccount, request, signal);
+        const result = await geminiProvider.ChatCompletion(targetAccount, request, signal, operationDeadline);
 
         // Record health success
         quotaManager.recordSuccess(targetAccount.id);
@@ -137,7 +138,7 @@ export class GatewayService {
         if (result.images && result.images.length > 0) {
           for (const img of result.images) {
             try {
-              const downloaded = await geminiProvider.downloadGeneratedImage(targetAccount, img.url, 2048, signal);
+              const downloaded = await geminiProvider.downloadGeneratedImage(targetAccount, img.url, 2048, signal, operationDeadline);
               const b64 = downloaded.data.toString('base64');
               img.b64_json = b64;
               const mediaId = `media_${crypto.randomBytes(8).toString('hex')}`;
@@ -289,9 +290,10 @@ export class GatewayService {
       const generatedImg = result.images[0];
       let b64: string | undefined;
       let mediaId: string | undefined;
+      const imgDeadline = Date.now() + (config.requestTimeout || 60000);
 
       try {
-        const downloaded = await geminiProvider.downloadGeneratedImage(targetAccount, generatedImg.url);
+        const downloaded = await geminiProvider.downloadGeneratedImage(targetAccount, generatedImg.url, 2048, undefined, imgDeadline);
         b64 = downloaded.data.toString('base64');
         mediaId = `media_${crypto.randomBytes(8).toString('hex')}`;
 
@@ -388,6 +390,7 @@ export class GatewayService {
 
     const excludedIds: string[] = [];
     const maxAttempts = config.maxUpstreamAttempts || 2;
+    const operationDeadline = Date.now() + (config.requestTimeout || 60000);
     let targetAccount: GeminiAccount | null = null;
     let isHardAffinity = false;
     let stream: AsyncIterable<any> | null = null;
@@ -439,7 +442,7 @@ export class GatewayService {
       accountScheduler.incrementActive(targetAccount.id);
 
       try {
-        stream = geminiProvider.ChatCompletionStream(targetAccount, request, signal);
+        stream = geminiProvider.ChatCompletionStream(targetAccount, request, signal, operationDeadline);
         streamIterator = stream[Symbol.asyncIterator]();
         firstStreamResult = await streamIterator.next();
         break; // Successfully connected and obtained first stream frame
